@@ -1,0 +1,46 @@
+# JARVIS — full profile: local language model + semantic memory.
+#
+#   pip install -r requirements-full.txt
+#
+# WEIGHT WARNING: torch alone is 200 MB - 2.5 GB depending on the build, and the
+# Qwen3 weights are 17-60 GB on disk. Read the note below before installing this
+# on a laptop — for most people the right answer is Ollama, not this file.
+
+-r requirements.txt
+
+# ---- Language model --------------------------------------------------------
+# AirLLM streams a model's layers from disk one at a time, so a 30B+ model runs
+# in a few GB of RAM. The cost is speed: on a CPU-only i5-10210U expect roughly
+# 10-50 SECONDS PER TOKEN. Fine for background subagents, unusable for live
+# voice conversation.
+#
+# AirLLM's real purpose is running a model that does NOT fit in RAM. On a 32 GB
+# machine Qwen3-30B-A3B quantised to ~19 GB *does* fit — via Ollama it runs at
+# roughly 4-8 tokens/sec, about two orders of magnitude faster for the same
+# weights.
+#
+# Recommendation for a 32 GB CPU-only laptop:
+#   winget install Ollama.Ollama          (or https://ollama.com)
+#   ollama pull qwen3:4b-instruct-2507-q4_K_M          # interactive voice
+#   ollama pull qwen3:30b-a3b-instruct-2507-q4_K_M     # background subagents
+# then set  llm.backend: ollama  in config.yaml. No entry in this file needed —
+# Ollama is a separate application, not a Python package.
+airllm>=2.11.0
+torch>=2.1.0
+transformers>=4.51.0           # 4.51+ is the first release with Qwen3 support
+accelerate>=0.27.0
+safetensors>=0.4.0
+
+# ---- Semantic memory -------------------------------------------------------
+# Without this JARVIS falls back to a built-in hashed-ngram embedder, which
+# still works but recalls less precisely.
+sentence-transformers>=2.3.0
+
+# ---- Audio conversion ------------------------------------------------------
+# Converts edge-tts MP3 output to WAV. Only needed if you want `jarvis say -o`
+# to write .wav files; playback and transcription both handle MP3 already.
+# An `ffmpeg` binary on PATH does the same job and is often already installed.
+pydub>=0.25.1
+
+# ---- Optional quantisation (CUDA only; ignore on integrated graphics) ------
+# bitsandbytes>=0.42.0

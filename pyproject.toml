@@ -1,0 +1,101 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jarvis-assistant"
+version = "1.1.0"
+description = "A local, voice-driven personal assistant with full machine access, durable memory, and a tree of self-directing subagents."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Jagat Goel" }]
+keywords = [
+    "assistant", "voice", "llm", "qwen", "vllm", "ollama",
+    "speech", "tts", "stt", "agents", "automation",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Home Automation",
+]
+
+# The core package runs on the standard library alone; everything that makes it
+# *useful* is an extra, so a broken optional wheel can never block installation.
+dependencies = []
+
+[project.optional-dependencies]
+speech = [
+    "faster-whisper>=1.0.0",
+    "edge-tts>=6.1.9",
+    "sounddevice>=0.4.6",
+    "numpy>=1.24",
+    "piper-tts>=1.2.0; python_version < '3.14'",
+    "pyttsx3>=2.90; sys_platform == 'win32'",
+]
+control = [
+    "psutil>=5.9",
+    "pyautogui>=0.9.54",
+    "keyboard>=0.13.5",
+    "mss>=9.0.1",
+    "Pillow>=10.0.0",
+]
+windows = [
+    "pywin32>=306; sys_platform == 'win32'",
+    "pystray>=0.19.5; sys_platform == 'win32'",
+]
+memory = ["sentence-transformers>=2.3.0"]
+# Local weights loaded in-process. Slow on CPU; see docs/MODELS.md.
+llm = [
+    "torch>=2.1.0",
+    "transformers>=4.51.0",
+    "accelerate>=0.27.0",
+    "safetensors>=0.4.0",
+]
+# Layer-streaming backend for models that do not fit in RAM. Very slow per token.
+airllm = ["airllm>=2.11.0"]
+# High-throughput batching server — the right choice for a tree of agents.
+# Linux only; on Windows run it under WSL2 or point llm.vllm_host at another host.
+vllm = ["vllm>=0.6.0; sys_platform == 'linux'"]
+config = ["PyYAML>=6.0"]
+dev = ["pytest>=7.4", "pytest-cov>=4.1", "ruff>=0.5"]
+all = ["jarvis-assistant[speech,control,windows,memory,config]"]
+
+[project.urls]
+Homepage = "https://github.com/hardcoregamingsyle/jarvis"
+Documentation = "https://github.com/hardcoregamingsyle/jarvis/tree/main/docs"
+Issues = "https://github.com/hardcoregamingsyle/jarvis/issues"
+
+[project.scripts]
+jarvis = "jarvis.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["jarvis*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+    "slow: takes more than a second",
+    "requires_audio: needs a real audio device",
+    "requires_linux: exercises a Linux-only code path",
+]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501", "B008"]

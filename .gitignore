@@ -1,0 +1,71 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Environments
+.venv/
+venv/
+env/
+
+# ---------------------------------------------------------------------------
+# Secrets and personal data — never commit these
+# ---------------------------------------------------------------------------
+# The live config may contain an api_key or a Hugging Face token.
+config.yaml
+config.yml
+config.json
+.env
+.env.*
+*.token
+hf_token*
+
+# Long-term memory: everything JARVIS has ever been told.
+*.db
+*.db-wal
+*.db-shm
+
+# Logs, including the audit journal of every action taken.
+logs/
+*.log
+audit.jsonl
+
+# ---------------------------------------------------------------------------
+# Large / machine-local artefacts
+# ---------------------------------------------------------------------------
+models/
+voices/*.onnx
+voices/*.onnx.json
+data/
+
+# Tools JARVIS wrote for itself at runtime live in the DATA directory, which is
+# outside the repo (see `jarvis config`). Do NOT add a bare `tools/` rule here:
+# gitignore patterns match at every depth, so it would silently exclude the
+# jarvis/tools/ package itself.
+
+# Generated launchers.
+# `/jarvis` alone would match the PACKAGE DIRECTORY as well as the launcher
+# script install.sh writes, excluding the entire source tree from the repo.
+# Re-include the directory explicitly.
+jarvis.bat
+/jarvis
+!/jarvis/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+.tox/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

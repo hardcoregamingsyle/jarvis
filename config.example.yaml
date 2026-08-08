@@ -1,0 +1,218 @@
+# JARVIS configuration.
+#
+# Copy to `config.yaml` (next to this file, or in your user config directory)
+# and edit. Every value here is the default, so delete anything you do not wish
+# to change. JSON works too if PyYAML is not installed.
+#
+# Any setting can also be set by environment variable:
+#   JARVIS_LLM_BACKEND=ollama
+#   JARVIS_VOICE_MODE=continuous
+#   JARVIS_SECURITY_MODE=guarded
+
+# ---------------------------------------------------------------------------
+# Language model
+# ---------------------------------------------------------------------------
+llm:
+  # auto | ollama | transformers | airllm | stub
+  #   "auto" probes ollama -> transformers -> airllm and takes the first that
+  #   works. AirLLM is probed LAST on purpose: its availability check is only an
+  #   import test, and it is ~100x slower than Ollama for a model that fits RAM.
+  backend: auto
+
+  #   Qwen/Qwen3-30B-A3B-Instruct-2507  — MoE, ~3B active/token. Best quality/speed.
+  #   Qwen/Qwen3-32B                    — dense, smarter, considerably slower.
+  #   Qwen/Qwen3-4B-Instruct-2507       — usable on CPU alone.
+  model: Qwen/Qwen3-30B-A3B-Instruct-2507
+
+  compression: ""            # "" | 4bit | 8bit  (needs bitsandbytes + CUDA)
+  layer_shards_dir: ""       # defaults to <data dir>/models
+  device: auto               # auto | cpu | cuda | mps
+
+  max_new_tokens: 512
+  temperature: 0.7
+  top_p: 0.9
+  top_k: 40
+  context_tokens: 8192       # also sent to Ollama as num_ctx
+
+  # Install from https://ollama.com  (winget install Ollama.Ollama)
+  ollama_host: http://127.0.0.1:11434
+  #   qwen3:4b-instruct-2507-q4_K_M       ~2.5 GB, ~15-25 tok/s  (interactive)
+  #   qwen3:30b-a3b-instruct-2507-q4_K_M  ~19 GB,  ~4-8 tok/s    (background)
+  ollama_model: qwen3:4b-instruct-2507-q4_K_M
+
+  allow_fallback: true
+  request_timeout: 600.0
+
+# ---------------------------------------------------------------------------
+# Speech to text
+# ---------------------------------------------------------------------------
+stt:
+  # auto | faster-whisper | whisper | vosk | windows | stub
+  #   "windows" uses the speech recogniser built into Windows — no download at
+  #   all, but noticeably less accurate than whisper. It exists so voice works
+  #   on a machine with nothing installed.
+  engine: auto
+  model: base.en             # tiny.en | base.en | small.en | medium.en
+  device: auto
+  compute_type: int8         # int8 is roughly twice as fast on CPU
+  language: en
+  sample_rate: 16000
+  vad_filter: true
+
+  # Voice activity detection — how the end of your sentence is detected.
+  # MEASURED ON THIS MACHINE: the room's noise floor is about 0.007, so 0.021
+  # (three times the floor) is a safer threshold than the 0.015 default.
+  # Run `jarvis calibrate` to measure your own room.
+  silence_threshold: 0.015
+  silence_duration: 0.9      # seconds of quiet that end an utterance
+  max_utterance_seconds: 30.0
+  input_device: null         # null = system default; `jarvis doctor` lists them
+
+# ---------------------------------------------------------------------------
+# The voice
+# ---------------------------------------------------------------------------
+tts:
+  # auto | piper | edge | sapi | pyttsx3 | espeak | null
+  #   auto order: piper -> edge -> sapi -> pyttsx3 -> espeak -> null
+  #   "sapi" is the Windows built-in voice: no download, but this machine only
+  #   has en-US voices installed (David, Zira), so it will not sound British.
+  #   Add a British voice: Settings > Time & language > Speech > Add voices.
+  engine: auto
+
+  # Piper: offline, neural, CPU-friendly. The default British voice.
+  #   en_GB-alan-medium     — male RP, measured. Closest to the films.
+  #   en_GB-northern_english_male-medium
+  #   en_GB-jenny_dioco-medium — female RP
+  piper_voice: en_GB-alan-medium
+  piper_model_path: ""       # defaults to <data dir>/voices/<voice>.onnx
+
+  # edge-tts: needs internet, and is the most convincing British voice.
+  #   en-GB-RyanNeural | en-GB-ThomasNeural | en-GB-SoniaNeural
+  # Returns MP3; playback and transcription both handle that fine.
+  edge_voice: en-GB-RyanNeural
+  edge_rate: "+0%"
+  edge_pitch: "+0Hz"
+
+  sapi_voice_hint: United Kingdom
+  speed: 1.0
+  volume: 1.0
+  output_device: null
+  enabled: true
+
+# ---------------------------------------------------------------------------
+# Memory — the "forgets nothing" store
+# ---------------------------------------------------------------------------
+memory:
+  db_path: ""                # defaults to <data dir>/memory.db (always absolute)
+  embedder: auto             # auto | sentence-transformers | hash | none
+  embed_model: sentence-transformers/all-MiniLM-L6-v2
+  embed_dim: 384
+
+  recall_k: 8                # recollections injected per turn
+  recall_min_score: 0.15
+
+  summarize_after_turns: 20
+  keep_recent_turns: 8
+  prune: false               # never delete anything
+
+# ---------------------------------------------------------------------------
+# Agent behaviour
+# ---------------------------------------------------------------------------
+agent:
+  name: JARVIS
+  user_title: Sir
+  max_tool_iterations: 8
+  max_concurrent_tasks: 4
+  subagent_timeout: 900.0
+  announce_updates: true
+  allow_tool_creation: true
+
+# ---------------------------------------------------------------------------
+# Access policy — OFF BY DEFAULT
+# ---------------------------------------------------------------------------
+# JARVIS ships unrestricted: it will run any command, write any file, and delete
+# anything you ask it to, without prompting. That is the intended behaviour for
+# a personal assistant on your own machine.
+#
+# The machinery below exists for anyone who wants restrictions. It does nothing
+# until you configure it.
+security:
+  # open     — run anything, no confirmation (THE DEFAULT)
+  # guarded  — confirm anything matching dangerous_patterns; refuse writes under
+  #            protected_paths
+  # readonly — observation only
+  mode: open
+
+  allow_shell: true
+  allow_file_write: true
+  allow_process_control: true
+  allow_network: true
+
+  # Only consulted in "guarded" mode when nothing can be asked (a headless run).
+  #   allow — proceed   |   deny — refuse
+  unattended_policy: allow
+
+  # Both lists are EMPTY by default: nothing is protected, nothing is flagged.
+  # Populate them only if you switch to guarded/readonly mode. For example:
+  # protected_paths:
+  #   - C:\Windows
+  #   - C:\Program Files
+  # dangerous_patterns:
+  #   - format
+  #   - diskpart
+  protected_paths: []
+  dangerous_patterns: []
+
+  command_timeout: 120.0
+  audit_log: true            # a record, not a restriction: <data>/logs/audit.jsonl
+
+# ---------------------------------------------------------------------------
+# Hands-free behaviour
+# ---------------------------------------------------------------------------
+voice:
+  # wake       — respond only when addressed by name (the default)
+  # continuous — open conversation, no wake word, until continuous_timeout of
+  #              silence re-arms it. Best when you are alone at the desk.
+  # push       — push-to-talk: records only while the hotkey is held
+  mode: wake
+
+  wake_words:
+    - jarvis
+    - hey jarvis
+  require_wake_word: true
+
+  # Barge-in: start talking and JARVIS stops speaking mid-sentence.
+  allow_interrupt: true
+  # How much louder than the room a sound must be to count as you interrupting.
+  # Too low and JARVIS interrupts itself by hearing its own voice through the
+  # speakers; raise it if that happens, lower it if barge-in feels unresponsive.
+  interrupt_margin: 2.5
+
+  # After a reply, this many seconds in which you need not repeat the wake word.
+  follow_up_seconds: 15.0
+  # In continuous mode, silence this long re-arms the wake word.
+  continuous_timeout: 120.0
+
+  # Audio kept from *before* speech was detected, so the first syllable of
+  # "Jarvis" is not clipped. Lower it only if latency matters more than accuracy.
+  preroll_seconds: 0.5
+  # Bursts shorter than this are coughs, clicks and door slams — not speech.
+  min_speech_seconds: 0.3
+
+  # Spoken when addressed by name with no request. Empty = "Yes, <user_title>?"
+  acknowledge: ""
+  greeting: Good day. All systems are online and at your disposal.
+
+# ---------------------------------------------------------------------------
+# Windows desktop integration
+# ---------------------------------------------------------------------------
+windows:
+  tray_icon: true                  # system-tray presence with a state indicator
+  hotkey_toggle: ctrl+alt+j        # start/stop listening
+  hotkey_push_to_talk: ctrl+alt+space
+  autostart: false                 # start JARVIS when you log in
+  notifications: true              # toast when a background task finishes
+
+# ---------------------------------------------------------------------------
+data_dir: ""                 # "" = platform default; see `jarvis config`
+log_level: INFO              # DEBUG | INFO | WARNING | ERROR

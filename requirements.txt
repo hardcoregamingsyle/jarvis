@@ -1,0 +1,47 @@
+# JARVIS — core requirements.
+#
+#   pip install -r requirements.txt
+#
+# Everything below was installed and VERIFIED WORKING on the target machine:
+# Windows 11, Python 3.14.6, CPU-only i5 laptop. The voice pipeline was tested
+# end to end on it — British speech synthesised, played, and transcribed back.
+#
+# Python 3.9+. Nothing here is strictly required: JARVIS starts without any of
+# it and reports what is missing via `jarvis doctor`. But without the speech
+# packages it cannot listen or talk, which rather defeats the point.
+
+# ---- Speech in -------------------------------------------------------------
+# Offline transcription. int8 on CPU. Decodes mp3/m4a/wav natively via PyAV, so
+# no ffmpeg is needed to transcribe. base.en is ~150 MB; tiny.en ~75 MB.
+faster-whisper>=1.0.0
+
+# ---- Speech out (the British voice) ---------------------------------------
+# en-GB-RyanNeural. Needs internet, and is by far the most convincing British
+# voice available. Returns MP3 (see requirements-full.txt for the converter).
+edge-tts>=6.1.9
+
+# Offline neural British voice. No internet, CPU-friendly. Preferred when
+# present; install it if you want JARVIS to work with the network down.
+# NOTE: as of Python 3.14 there may be no piper wheel yet — it is optional and
+# JARVIS falls back to edge-tts or the Windows SAPI voice automatically.
+piper-tts>=1.2.0 ; python_version < "3.14"
+
+# ---- Audio devices ---------------------------------------------------------
+sounddevice>=0.4.6             # microphone capture and playback
+numpy>=1.24                    # audio buffers; also speeds up resampling
+
+# ---- Machine control -------------------------------------------------------
+psutil>=5.9                    # processes, CPU, memory, battery, disks
+pyautogui>=0.9.54              # keyboard and mouse control (voice-driven typing)
+keyboard>=0.13.5               # global hotkeys / push-to-talk
+mss>=9.0.1                     # screenshots
+Pillow>=10.0.0                 # screenshots, tray icon rendering
+
+# ---- Windows desktop integration ------------------------------------------
+# Window management, SAPI voices, autostart, tray. Windows only; pip skips these
+# elsewhere.
+pywin32>=306 ; sys_platform == "win32"
+pystray>=0.19.5 ; sys_platform == "win32"
+
+# ---- Configuration ---------------------------------------------------------
+PyYAML>=6.0                    # optional: YAML config (JSON works without it)
