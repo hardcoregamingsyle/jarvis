@@ -12,5 +12,5 @@ lazily inside the module that needs it, so the core package imports cleanly on
 any machine and the test-suite runs without GPUs or multi-gigabyte models.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __all__ = ["__version__"]
