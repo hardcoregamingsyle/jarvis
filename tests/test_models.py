@@ -18,6 +18,7 @@ import pytest
 from jarvis.core.config import LLMConfig, load_config
 from jarvis.llm import models
 from jarvis.llm.models import (
+    DEFAULT_ALIAS,
     KNOWN_MODELS,
     ModelSpec,
     UnknownModelError,
@@ -635,7 +636,10 @@ def test_the_new_llm_fields_have_the_documented_defaults():
     assert llm.max_concurrent_requests == 8
     assert llm.model_revision == ""
     assert llm.trust_remote_code is False
-    assert llm.model == "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    # The default model is asserted in tests/test_default_model.py, which
+    # also pins the figures behind it. Checking the identity here keeps the
+    # two in step without duplicating the justification.
+    assert llm.model == resolve(DEFAULT_ALIAS).id
 
 
 def test_load_config_honours_the_standard_hugging_face_variables():

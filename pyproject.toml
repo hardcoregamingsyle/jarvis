@@ -58,7 +58,7 @@ memory = ["sentence-transformers>=2.3.0"]
 # Local weights loaded in-process. Slow on CPU; see docs/MODELS.md.
 llm = [
     "torch>=2.1.0",
-    "transformers>=4.51.0",
+    "transformers>=4.57.0",
     "accelerate>=0.27.0",
     "safetensors>=0.4.0",
 ]

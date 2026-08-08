@@ -62,10 +62,11 @@ never heard of (see [§5](#5-adding-a-model-to-the-catalogue)).
 | `qwen3-8b` | `Qwen/Qwen3-8B` | 8.2B | dense | 32k | 4.9 GB | Borderline for CPU voice latency |
 | `qwen3-14b` | `Qwen/Qwen3-14B` | 14.8B | dense | 32k | 8.9 GB | Background work, not conversation |
 | `qwen3-32b` | `Qwen/Qwen3-32B` | 32.8B | dense | 32k | 19.7 GB | Smartest dense Qwen3; wants a GPU |
-| **`qwen3-30b-a3b`** | `Qwen/Qwen3-30B-A3B-Instruct-2507` | 30.5B | **3.3B** | 256k | 18.3 GB | **The default.** Best trade-off on 32 GB CPU |
+| `qwen3-30b-a3b` | `Qwen/Qwen3-30B-A3B-Instruct-2507` | 30.5B | **3.3B** | 256k | 18.3 GB | Best speed/quality trade-off on 32 GB CPU |
 | `qwen3-coder-30b-a3b` | `Qwen/Qwen3-Coder-30B-A3B-Instruct` | 30.5B | 3.3B | 256k | 18.3 GB | Same shape, tuned for code and tool calls |
 | `qwen3-235b-a22b` | `Qwen/Qwen3-235B-A22B-Instruct-2507` | 235B | 22B | 256k | 141 GB | Far past one laptop |
 | `llama3.1-8b` | `meta-llama/Llama-3.1-8B-Instruct` | 8B | dense | 128k | 4.9 GB | **Gated** — accept Meta's licence first |
+| **`qwen3.6-27b`** | `Qwen/Qwen3.6-27B` | 27B | dense | **256k** | 16.1 GB | **The default.** Strongest that fits 32 GB; multimodal; dense, so ~1 tok/s on CPU |
 | `qwen3.8-27b` | `Qwen/Qwen3.8-27B` | 27B | — | 256k | 16.2 GB | **NOT RELEASED.** Placeholder figures |
 
 ### `Qwen3.8-27B` is not a real model
@@ -411,7 +412,7 @@ weights beneath a working deployment.
 
 ```yaml
 llm:
-  model: Qwen/Qwen3-30B-A3B-Instruct-2507
+  model: Qwen/Qwen3.6-27B
   model_revision: "a1b2c3d4e5f6..."     # a commit SHA from the repo's Files page
 ```
 

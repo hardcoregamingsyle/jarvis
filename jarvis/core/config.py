@@ -65,11 +65,16 @@ class LLMConfig:
 
     # "airllm", "ollama", "transformers", "stub", or "auto".
     backend: str = "auto"
-    # Qwen3 family.  The 30B-A3B MoE activates ~3B params/token and is by far
-    # the best speed/quality trade-off on a CPU-bound laptop; the dense 32B is
-    # smarter but much slower there.  The -2507 checkpoints are Qwen's July 2025
-    # revision and supersede the original hybrid-thinking releases.
-    model: str = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    # Qwen3.6-27B: dense 27B, vision-language, 262K native context. The most
+    # capable model that still fits 32 GB at Q4 (~16 GB), and it needs
+    # transformers >= 4.57 for the Qwen3_5 architecture.
+    #
+    # Being DENSE is the trade-off: every one of the 27B parameters is read per
+    # token, where Qwen3-30B-A3B activates only ~3B. On a CPU-only box that is
+    # roughly 1 tok/s against 4-8. It also thinks by default, emitting hundreds
+    # of <think> tokens before it answers. For live voice on such a machine,
+    # prefer `qwen3-4b` here and leave this one to background subagents.
+    model: str = "Qwen/Qwen3.6-27B"
     # AirLLM streams layers from disk; this is where they get cached.
     compression: str = ""            # "" | "4bit" | "8bit"  (needs bitsandbytes)
     layer_shards_dir: str = ""       # defaults to <data>/models
@@ -81,7 +86,7 @@ class LLMConfig:
     context_tokens: int = 8192
     # Ollama fallback settings
     ollama_host: str = "http://127.0.0.1:11434"
-    ollama_model: str = "qwen3:4b-instruct-2507-q4_K_M"
+    ollama_model: str = "qwen3.6:27b"
     # OpenAI-compatible server (vLLM and friends); see the class docstring.
     vllm_host: str = "http://127.0.0.1:8000/v1"
     api_key: str = ""

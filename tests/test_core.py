@@ -72,7 +72,12 @@ def test_task_gets_an_id_and_starts_pending():
 # --------------------------------------------------------------------------- #
 def test_defaults_are_the_documented_ones():
     cfg = load_config(use_env=False)
-    assert cfg.llm.model.startswith("Qwen/Qwen3-")
+    # Deliberately not a "Qwen/Qwen3-" prefix match: the family gained a dotted
+    # generation (Qwen3.6-27B), and that assertion excluded the very model it
+    # was written to allow. The default is pinned properly, with the figures
+    # behind it, in tests/test_default_model.py.
+    org, _, name = cfg.llm.model.partition("/")
+    assert org == "Qwen" and name, f"unexpected default model {cfg.llm.model!r}"
     assert cfg.tts.edge_voice == "en-GB-RyanNeural"
     assert cfg.tts.piper_voice.startswith("en_GB")
     # Ships unrestricted: no prompts, no protected paths, no blocked commands.

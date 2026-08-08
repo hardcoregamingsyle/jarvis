@@ -19,7 +19,7 @@ it still boots; each subsystem degrades rather than failing.
 |---|---|
 | **Listens** | Offline speech-to-text — faster-whisper (`base.en` by default), Whisper, Vosk, or the Windows recogniser. Wake-word gating on the transcript, no second model |
 | **Speaks** | British RP — Piper `en_GB-alan-medium` offline, edge-tts `en-GB-RyanNeural` online, or the OS voice. Barge-in: start talking and it stops mid-sentence |
-| **Thinks** | Any Hugging Face model, through vLLM, Ollama, any OpenAI-compatible server, transformers, or AirLLM. Default `Qwen/Qwen3-30B-A3B-Instruct-2507` |
+| **Thinks** | Any Hugging Face model, through vLLM, Ollama, any OpenAI-compatible server, transformers, or AirLLM. Default `Qwen/Qwen3.6-27B` |
 | **Remembers** | SQLite plus vector search. `memory.prune` is `false` — nothing is ever deleted, and recall spans every past conversation |
 | **Acts** | 72 built-in tools: files, shell, processes, services, apps, windows, keyboard, mouse, clipboard, screenshots, network |
 | **Delegates** | Long jobs become background subagents with their own tool access; the main agent answers you immediately and relays reports when they land |
@@ -309,15 +309,32 @@ a working spec, because that is how every new model starts life.
 | `qwen3-8b` | `Qwen/Qwen3-8B` | 8.2B | dense | 32k | 4.9 GB |
 | `qwen3-14b` | `Qwen/Qwen3-14B` | 14.8B | dense | 32k | 8.9 GB |
 | `qwen3-32b` | `Qwen/Qwen3-32B` | 32.8B | dense | 32k | 19.7 GB |
-| **`qwen3-30b-a3b`** | `Qwen/Qwen3-30B-A3B-Instruct-2507` | 30.5B | **3.3B** | 256k | 18.3 GB |
+| `qwen3-30b-a3b` | `Qwen/Qwen3-30B-A3B-Instruct-2507` | 30.5B | **3.3B** | 256k | 18.3 GB |
 | `qwen3-coder-30b-a3b` | `Qwen/Qwen3-Coder-30B-A3B-Instruct` | 30.5B | 3.3B | 256k | 18.3 GB |
 | `qwen3-235b-a22b` | `Qwen/Qwen3-235B-A22B-Instruct-2507` | 235B | 22B | 256k | 141 GB |
 | `llama3.1-8b` | `meta-llama/Llama-3.1-8B-Instruct` | 8B | dense | 128k | 4.9 GB — **gated** |
+| **`qwen3.6-27b`** | `Qwen/Qwen3.6-27B` | 27B | dense | **256k** | 16.1 GB |
 | `qwen3.8-27b` | `Qwen/Qwen3.8-27B` | — | — | — | **not released** |
 
-The default is `qwen3-30b-a3b`: 30B of knowledge, ~3B of arithmetic per token.
-On a CPU-only 32 GB laptop that mixture-of-experts shape is roughly ten times
-faster than the dense 32B for the same download size. Full reasoning, the
+The default is **`qwen3.6-27b`** (`Qwen/Qwen3.6-27B`): a dense 27B
+vision-language model with a 262,144-token native context, extensible to about
+1M with YaRN. It is the most capable thing that still fits 32 GB at Q4 (~16 GB),
+and it accepts images and video as well as text. It needs `transformers >= 4.57`
+for the `Qwen3_5` architecture, and it **thinks by default**, emitting a
+`<think>…</think>` block before every answer.
+
+Be aware of the trade-off before pointing a microphone at it. Dense means all
+27B parameters are read for every token, where `qwen3-30b-a3b` activates only
+~3.3B. On a CPU-only laptop that is roughly **1 tok/s against 4–8**, and the
+default thinking block multiplies the wait. For live conversation on such a
+machine, set `llm.model: Qwen/Qwen3-4B-Instruct-2507` and leave Qwen3.6 to
+background subagents — or serve it from a GPU box over vLLM and point
+`llm.vllm_host` at it. `jarvis model recommend` will tell you the same thing:
+it ranks by *active* parameters, not total.
+
+The mixture-of-experts alternative, `qwen3-30b-a3b`, gives 30B of knowledge for
+~3B of arithmetic per token. On a CPU-only 32 GB laptop that shape is roughly
+ten times faster than the dense 32B for the same download size. Full reasoning, the
 quantisation arithmetic and the context-vs-RAM tables are in
 [docs/MODELS.md](docs/MODELS.md).
 
@@ -346,7 +363,7 @@ changes the weights beneath a working deployment.
 
 ```yaml
 llm:
-  model: Qwen/Qwen3-30B-A3B-Instruct-2507
+  model: Qwen/Qwen3.6-27B
   model_revision: "9a1b2c3..."     # commit SHA, branch or tag
 ```
 

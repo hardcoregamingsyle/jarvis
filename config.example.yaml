@@ -19,10 +19,16 @@ llm:
   #   import test, and it is ~100x slower than Ollama for a model that fits RAM.
   backend: auto
 
-  #   Qwen/Qwen3-30B-A3B-Instruct-2507  — MoE, ~3B active/token. Best quality/speed.
+  # Any Hugging Face repo id. `jarvis model list` shows the known aliases.
+  #   Qwen/Qwen3.6-27B                  — DEFAULT. Dense 27B, vision+text, 262K
+  #                                       context, ~16 GB at Q4. The strongest
+  #                                       model that fits 32 GB — but dense, so
+  #                                       ~1 tok/s on CPU, and it thinks before
+  #                                       answering. Needs transformers >= 4.57.
+  #   Qwen/Qwen3-30B-A3B-Instruct-2507  — MoE, ~3B active/token, ~4-8 tok/s on CPU.
+  #   Qwen/Qwen3-4B-Instruct-2507       — the one that feels like conversation.
   #   Qwen/Qwen3-32B                    — dense, smarter, considerably slower.
-  #   Qwen/Qwen3-4B-Instruct-2507       — usable on CPU alone.
-  model: Qwen/Qwen3-30B-A3B-Instruct-2507
+  model: Qwen/Qwen3.6-27B
 
   compression: ""            # "" | 4bit | 8bit  (needs bitsandbytes + CUDA)
   layer_shards_dir: ""       # defaults to <data dir>/models
@@ -36,9 +42,10 @@ llm:
 
   # Install from https://ollama.com  (winget install Ollama.Ollama)
   ollama_host: http://127.0.0.1:11434
-  #   qwen3:4b-instruct-2507-q4_K_M       ~2.5 GB, ~15-25 tok/s  (interactive)
+  #   qwen3.6:27b                         ~16 GB,  ~1 tok/s     (most capable)
   #   qwen3:30b-a3b-instruct-2507-q4_K_M  ~19 GB,  ~4-8 tok/s    (background)
-  ollama_model: qwen3:4b-instruct-2507-q4_K_M
+  #   qwen3:4b-instruct-2507-q4_K_M       ~2.5 GB, ~15-25 tok/s  (interactive)
+  ollama_model: qwen3.6:27b
 
   allow_fallback: true
   request_timeout: 600.0

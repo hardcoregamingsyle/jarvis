@@ -269,6 +269,33 @@ KNOWN_MODELS: Dict[str, ModelSpec] = {
     # `jarvis model list` shows it as a known-but-unavailable target instead of
     # silently pretending the name was a typo.  When it ships: set exists=True
     # (and correct the figures).  That is the entire change.
+    # Verified against the Hugging Face API on 2026-08-08: 15 safetensors
+    # shards totalling 55.6 GB in bf16, ungated, 6.7M downloads. config.json
+    # reports model_type "qwen3_5", architecture Qwen3_5ForConditionalGeneration,
+    # 64 layers, hidden 5120, GQA 24/4, max_position_embeddings 262144, and a
+    # vision encoder alongside the text tower.
+    "qwen3.6-27b": ModelSpec(
+        id="Qwen/Qwen3.6-27B",
+        label="Qwen3.6 27B (dense, vision-language)",
+        params=27.0,
+        family="qwen3",
+        context=262144,
+        # Q4_K_S GGUF measured at 16.1 GB; IQ4_XS 15.7 GB; Q3_K_M 13.8 GB.
+        quantised_size_gb=16.1,
+        notes=(
+            "Strongest model that still fits 32 GB at Q4, and multimodal "
+            "(image and video in) with a 262K context extensible to ~1M via "
+            "YaRN. DENSE, though: all 27B parameters are read per token, so on "
+            "a CPU-only box expect roughly 1 tok/s against 4-8 for the "
+            "30B-A3B MoE, which activates only ~3B. Thinking mode is ON by "
+            "default and emits hundreds of <think> tokens before answering — "
+            "disable it for anything interactive. Serve with vLLM/SGLang on a "
+            "GPU, or Ollama GGUF on CPU. Needs transformers >= 4.57."
+        ),
+        backends=_ALL_BACKENDS,
+        ollama_tag="qwen3.6:27b",
+        exists=True,
+    ),
     "qwen3.8-27b": ModelSpec(
         id="Qwen/Qwen3.8-27B",
         label="Qwen3.8 27B (unreleased)",
@@ -276,14 +303,16 @@ KNOWN_MODELS: Dict[str, ModelSpec] = {
         family="qwen3",
         context=262144,
         quantised_size_gb=16.2,
-        notes="Not released yet — no such repository exists on Hugging Face. "
-              "Figures are placeholders. Use qwen3-30b-a3b until it ships.",
+        notes="Not released yet — the repository is not publicly readable. "
+              "Figures are placeholders. Its released predecessor is "
+              "qwen3.6-27b, which is the current default; switching when 3.8 "
+              "ships means flipping exists=False here.",
         backends=_ALL_BACKENDS,
         exists=False,
     ),
 }
 
-DEFAULT_ALIAS = "qwen3-30b-a3b"
+DEFAULT_ALIAS = "qwen3.6-27b"
 
 # Populated at the end of the module, once the normalisation helper exists.
 _ID_INDEX: Dict[str, str] = {}
