@@ -6,6 +6,7 @@
     jarvis say "..."       # one-shot: speak a line (voice check)
     jarvis ask "..."       # one-shot: answer and exit
     jarvis doctor          # what is installed, what is missing, how to fix it
+    jarvis hardware        # detect CPU/GPU/accelerator; show the model/backend plan
     jarvis config          # show or write the effective configuration
     jarvis tools           # list registered tools
     jarvis memory          # inspect / search long-term memory
@@ -155,6 +156,104 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         _out("  pip install -r requirements-full.txt")
     else:
         _out("\nEverything is installed.")
+    return 0
+
+
+def cmd_hardware(args: argparse.Namespace) -> int:
+    """Report detected hardware and the model/backend plan it leads to.
+
+    ``jarvis.core.hardware`` and ``jarvis.llm.planner`` are imported here,
+    lazily, and only here — the same pattern ``cmd_tools``/``cmd_memory`` use
+    for their own optional subsystems — so a problem in either one (a probe
+    raising on some odd machine, or an older checkout that predates this
+    feature entirely) shows up as a message on this command rather than
+    taking the rest of the CLI down with it. Mirrors ``cmd_doctor``'s existing
+    try/except tolerance for a subsystem that fails to build.
+
+    Bound to the real APIs: ``jarvis.core.hardware.detect() -> HardwareProfile``
+    and ``summary(profile) -> str``, and ``jarvis.llm.planner.plan(cfg) ->
+    HardwarePlan``. ``HardwareProfile.accelerator``/``HardwarePlan.accelerator``
+    is a *reporting* label (``"cuda"``/``"rocm"``/``"mps"``/``"tpu"``/``"none"``);
+    ``HardwarePlan.device`` is the literal string a backend would pass to
+    ``torch.device(...)`` and is never ``"rocm"`` — an AMD ROCm PyTorch build
+    is still addressed as ``"cuda"``. This command only displays both; it does
+    not decide between them.
+    """
+    cfg = _load(args)
+    _out(BANNER)
+
+    try:
+        from .core import hardware as hardware_module
+        from .llm import planner as planner_module
+    except Exception as exc:  # noqa: BLE001
+        _out(f"Hardware detection is not available in this copy of JARVIS: {exc}")
+        _out("Run 'jarvis doctor' to check the rest of the environment.")
+        log.exception("hardware: could not import jarvis.core.hardware / jarvis.llm.planner")
+        return 1
+
+    _out("Detected hardware")
+    try:
+        profile = hardware_module.detect()
+        summary_line = hardware_module.summary(profile)
+    except Exception as exc:  # noqa: BLE001
+        _out(f"  detection failed: {exc}")
+        log.exception("hardware: detect()/summary() failed")
+        return 1
+
+    _out(f"  {summary_line}")
+    to_dict = getattr(profile, "to_dict", None)
+    detail = to_dict() if callable(to_dict) else {}
+    profile_notes = []
+    if isinstance(detail, dict):
+        profile_notes = list(detail.pop("notes", None) or [])
+        for key, value in detail.items():
+            _out(f"    {key:<12} {value}")
+    if profile_notes:
+        _out("  Detection notes")
+        for note in profile_notes:
+            _out(f"    - {note}")
+
+    _out("\nPlan")
+    try:
+        plan = planner_module.plan(cfg)
+    except Exception as exc:  # noqa: BLE001
+        _out(f"  planning failed: {exc}")
+        log.exception("hardware: plan() failed")
+        return 1
+
+    for label, attr in (
+        ("backend", "backend"),
+        ("device", "device"),
+        ("accelerator", "accelerator"),
+        ("model (interactive)", "model_interactive"),
+        ("model (background)", "model_background"),
+        ("quantisation", "quantisation"),
+    ):
+        value = getattr(plan, attr, None)
+        _out(f"  {label:<20} {value if value not in (None, '') else '(unknown)'}")
+
+    fits_vram = getattr(plan, "fits_vram", None)
+    fits_display = "(unknown)" if fits_vram is None else ("yes" if fits_vram else "no")
+    _out(f"  {'fits VRAM':<20} {fits_display}")
+
+    notes = list(getattr(plan, "notes", None) or [])
+    if notes:
+        _out("\nNotes")
+        for note in notes:
+            _out(f"  - {note}")
+
+    hw_cfg = cfg.hardware
+    if getattr(hw_cfg, "mode", "auto") == "manual":
+        _out("\nManual overrides (hardware.mode = manual)")
+        for name, value, is_auto in (
+            ("accelerator", hw_cfg.accelerator, hw_cfg.accelerator in ("", "auto")),
+            ("vram_gb", hw_cfg.vram_gb, not hw_cfg.vram_gb),
+            ("ram_gb", hw_cfg.ram_gb, not hw_cfg.ram_gb),
+            ("gpu_count", hw_cfg.gpu_count, not hw_cfg.gpu_count),
+        ):
+            state = "auto (not overridden)" if is_auto else f"manual override -> {value}"
+            _out(f"  {name:<12} {state}")
+
     return 0
 
 
@@ -658,6 +757,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("chat", help="interactive text conversation").set_defaults(func=cmd_chat)
     sub.add_parser("voice", help="hands-free conversation").set_defaults(func=cmd_voice)
     sub.add_parser("doctor", help="check dependencies and configuration").set_defaults(func=cmd_doctor)
+    sub.add_parser(
+        "hardware",
+        help="detect CPU/GPU/accelerator and show the model/backend plan",
+    ).set_defaults(func=cmd_hardware)
     sub.add_parser("tools", help="list registered tools").set_defaults(func=cmd_tools)
 
     p_ask = sub.add_parser("ask", help="ask one question and exit")

@@ -711,6 +711,25 @@ model you cannot otherwise load, and for nothing else.
 
 ---
 
+## Hardware & compatibility
+
+```bash
+jarvis hardware
+```
+
+JARVIS auto-detects what it is running on — CPU-only, NVIDIA (CUDA), AMD
+(ROCm), Apple Silicon (MPS), or Google TPU (detected, but not yet accelerated
+by any backend here — falls back to CPU) — and reports the backend, device and
+model pair it would recommend. `config.yaml`'s new `hardware:` section
+overrides auto-detection when it gets a machine wrong (a VM with GPU
+passthrough `nvidia-smi` cannot see, a container reporting the host's full RAM
+instead of its cgroup limit) or when you just want to plan for hardware you do
+not have in front of you. See [docs/HARDWARE.md](docs/HARDWARE.md) for the full
+compatibility matrix, the 32 GB RAM / 8 GB VRAM worked example, and the
+ROCm/CUDA device-string fact that is easy to get backwards.
+
+---
+
 ## Voice
 
 ```bash
@@ -954,6 +973,7 @@ docs/           architecture, operations, models, tool authoring, testing, troub
 | [docs/UPDATING.md](docs/UPDATING.md) | What re-running the installer updates, what it deliberately leaves alone, and how to roll back |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How the pieces fit: the agent loop, the task tree, the event bus |
 | [docs/MODELS.md](docs/MODELS.md) | Qwen3 family, dense vs MoE, quantisation, context vs RAM, adding a model |
+| [docs/HARDWARE.md](docs/HARDWARE.md) | Auto-detection, the compatibility matrix, the ROCm/CUDA device-string fact, TPU's detected-not-accelerated gap |
 | [docs/TOOL_AUTHORING.md](docs/TOOL_AUTHORING.md) | The specification for writing a tool — for humans and for JARVIS itself |
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | Running it day to day: the service, logs, backups |
 | [docs/TESTING.md](docs/TESTING.md) | How the suite is built and how to add to it |

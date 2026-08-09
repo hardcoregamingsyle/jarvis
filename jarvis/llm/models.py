@@ -587,8 +587,25 @@ def quantisation_bits(quantisation: Any) -> float:
     return _BITS[""]
 
 
+def _positive_float(value: Any) -> float:
+    """Best-effort coercion to a positive float, or ``0.0`` for anything else.
+
+    Used to normalise ``vram_gb`` arguments: ``None``, ``0``, a negative number,
+    or an unparsable value are all treated identically as "no VRAM figure was
+    given", so callers never have to pre-validate what they pass in.
+    """
+    if value is None:
+        return 0.0
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return out if out > 0 else 0.0
+
+
 def estimate_footprint(spec: Any, quantisation: str = "q4", *,
-                       context: Optional[int] = None) -> Dict[str, Any]:
+                       context: Optional[int] = None,
+                       vram_gb: Optional[float] = None) -> Dict[str, Any]:
     """Rough download and RAM figures for running ``spec`` at ``quantisation``.
 
     ``spec`` may be a :class:`ModelSpec` or any string :func:`resolve` accepts.
@@ -597,6 +614,12 @@ def estimate_footprint(spec: Any, quantisation: str = "q4", *,
 
     Returns a dict with ``download_gb``, ``weights_gb``, ``kv_cache_gb`` and
     ``ram_gb`` (all 10^9 bytes), plus the inputs used to compute them.
+
+    ``vram_gb``, when given and positive, adds two more keys: ``fits_vram``
+    (bool) and ``vram_headroom_gb`` (float, may be negative) — whether the
+    weights plus KV cache alone (no system RAM) fit in that much VRAM. Omit it
+    (the default) and the returned dict is byte-for-byte what earlier callers
+    already depend on.
     """
     if not isinstance(spec, ModelSpec):
         try:
@@ -619,7 +642,7 @@ def estimate_footprint(spec: Any, quantisation: str = "q4", *,
     kv_gb = (ctx / 1000.0) * spec.effective_params * _KV_GB_PER_1K_PER_B
     ram_gb = weights_gb * _WEIGHT_OVERHEAD + kv_gb + _RUNTIME_BASE_GB
 
-    return {
+    result = {
         "model": spec.id,
         "label": spec.label,
         "quantisation": str(quantisation or "fp16").lower(),
@@ -633,6 +656,14 @@ def estimate_footprint(spec: Any, quantisation: str = "q4", *,
         "ram_gb": round(ram_gb, 2),
         "note": "Estimates in 10^9-byte GB; assumes weights held in RAM.",
     }
+
+    vgb = _positive_float(vram_gb)
+    if vgb:
+        headroom = vgb - (weights_gb + kv_gb)
+        result["fits_vram"] = headroom >= 0
+        result["vram_headroom_gb"] = round(headroom, 2)
+
+    return result
 
 
 # Fraction of system RAM the weights may claim.  The rest is KV cache, the OS,
@@ -648,8 +679,15 @@ _QUALITY_PURPOSES = {"quality", "reasoning", "deep", "batch", "analysis", "resea
 _SMALL_PURPOSES = {"tiny", "fast", "draft", "small", "cheap"}
 
 
+def _purpose_score(spec: ModelSpec, *, wants_code: bool) -> tuple:
+    """Shared ranking key: purpose match first, then biggest-but-cheapest-per-token."""
+    specialised = "coder" in spec.family or "coder" in spec.id.lower()
+    purpose_fit = 1 if specialised == wants_code else 0
+    return (purpose_fit, spec.params, -spec.effective_params, spec.id)
+
+
 def recommend(ram_gb: float = 32.0, has_gpu: bool = False,
-              purpose: str = "chat") -> ModelSpec:
+              purpose: str = "chat", *, vram_gb: Optional[float] = None) -> ModelSpec:
     """Pick the best catalogue model that will actually run on this machine.
 
     Sizing is honest rather than aspirational: weights get at most 60% of
@@ -658,6 +696,17 @@ def recommend(ram_gb: float = 32.0, has_gpu: bool = False,
     30B-A3B mixture-of-experts (30B of knowledge, ~3B of arithmetic per token)
     and not the dense 32B that would technically almost fit and then answer at
     a word every few seconds.
+
+    ``vram_gb``, when given and positive, is consulted first: a model whose Q4
+    weights *and* KV cache both fit inside that much VRAM (via
+    :func:`estimate_footprint`) is strongly preferred, because it runs entirely
+    resident on the GPU rather than partially offloaded. When nothing fits
+    whole, a mixture-of-experts model is preferred if one fits the RAM budget
+    — Ollama offloads MoE expert layers to the GPU partially and keeps the
+    rest in system RAM, which is a perfectly good outcome for "GPU present but
+    not big enough for this model", not a failure. Only when neither of those
+    applies does this fall back to the plain ``ram_gb``/``has_gpu`` logic
+    below, exactly as if ``vram_gb`` had never been passed.
 
     Never raises: with an absurdly small budget it returns the smallest model
     in the catalogue.
@@ -669,6 +718,27 @@ def recommend(ram_gb: float = 32.0, has_gpu: bool = False,
 
     key = normalise_alias(purpose) or "chat"
     candidates = [s for s in KNOWN_MODELS.values() if s.exists and not s.gated]
+    wants_code = key in _CODE_PURPOSES
+
+    vgb = _positive_float(vram_gb)
+    if vgb:
+        vram_fits = [
+            s for s in candidates
+            if estimate_footprint(s, "q4", vram_gb=vgb).get("fits_vram")
+        ]
+        if vram_fits:
+            if key in _SMALL_PURPOSES:
+                return min(vram_fits, key=lambda s: (s.params, s.id))
+            return max(vram_fits, key=lambda s: _purpose_score(s, wants_code=wants_code))
+
+        # Nothing fits whole in VRAM: a mixture-of-experts model that fits the
+        # RAM budget is the honest recommendation for "GPU present but not big
+        # enough" — see the docstring above. Falls through to the plain
+        # ram_gb/has_gpu logic below when no MoE model fits either.
+        moe_fits = [s for s in candidates if s.is_moe and s.quantised_size_gb <= budget]
+        if moe_fits and key not in _SMALL_PURPOSES:
+            return max(moe_fits, key=lambda s: _purpose_score(s, wants_code=wants_code))
+
     fits = [s for s in candidates if s.quantised_size_gb <= budget]
     if not fits:
         return min(candidates, key=lambda s: (s.quantised_size_gb, s.params))
@@ -682,14 +752,7 @@ def recommend(ram_gb: float = 32.0, has_gpu: bool = False,
         if responsive:
             fits = responsive
 
-    wants_code = key in _CODE_PURPOSES
-
-    def score(spec: ModelSpec) -> tuple:
-        specialised = "coder" in spec.family or "coder" in spec.id.lower()
-        purpose_fit = 1 if specialised == wants_code else 0
-        return (purpose_fit, spec.params, -spec.effective_params, spec.id)
-
-    best = max(fits, key=score)
+    best = max(fits, key=lambda s: _purpose_score(s, wants_code=wants_code))
     if key in _QUALITY_PURPOSES and not has_gpu:
         logger.debug(
             "Recommending %s for %r on CPU: expect batch-speed, not conversation.",

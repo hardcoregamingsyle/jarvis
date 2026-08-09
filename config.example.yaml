@@ -221,5 +221,22 @@ windows:
   notifications: true              # toast when a background task finishes
 
 # ---------------------------------------------------------------------------
+# Hardware — manual overrides for auto-detection
+# ---------------------------------------------------------------------------
+# JARVIS probes the machine it is on (see `jarvis hardware`) and picks a backend
+# and model accordingly: RAM-only, NVIDIA, AMD/ROCm, Apple Silicon (MPS), or
+# Google TPU (detected but not yet usable by any backend here — falls back to
+# CPU). Everything below is OFF by default (mode: auto); set mode: manual only
+# when detection gets this machine wrong (a VM with passed-through GPU that
+# nvidia-smi cannot see, a container with a fake /proc/meminfo, etc.) and you
+# want to state the truth yourself instead.
+hardware:
+  mode: auto            # auto | manual
+  accelerator: auto     # auto | cuda | rocm | mps | tpu | cpu
+  vram_gb: 0.0           # 0 = auto-detect (GPU/accelerator memory, in GB)
+  ram_gb: 0.0            # 0 = auto-detect (system RAM, in GB)
+  gpu_count: 0           # 0 = auto-detect (number of GPUs/accelerators)
+
+# ---------------------------------------------------------------------------
 data_dir: ""                 # "" = platform default; see `jarvis config`
 log_level: INFO              # DEBUG | INFO | WARNING | ERROR

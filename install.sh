@@ -824,6 +824,32 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
+#  Hardware detection (report only)
+#
+#  Advisory: prints what jarvis.core.hardware / jarvis.llm.planner see on this
+#  machine so the download-plan numbers further down have context. Uses
+#  $PYTHON here, not $VPY -- this runs before the virtual environment exists.
+#  That works because every third-party import inside those two modules is
+#  lazy (see jarvis/core/hardware.py and jarvis/llm/planner.py): `python -m
+#  jarvis hardware` runs fine against a bare interpreter with nothing
+#  pip-installed at all. This step is pure reporting -- it never sets or reads
+#  MAIN_TAG/FAST_TAG and has no bearing on the download-plan or
+#  model-selection logic further down, which are computed independently. A
+#  checkout that predates this feature, or any other failure, degrades to a
+#  one-line note rather than aborting the install -- the same tolerance
+#  already given to jarvis.runtime being absent.
+# --------------------------------------------------------------------------- #
+step "Detecting hardware"
+HARDWARE_REPORT="$("$PYTHON" -m jarvis hardware 2>/dev/null)" || true
+if [ -n "$HARDWARE_REPORT" ]; then
+    while IFS= read -r hw_line; do
+        info "$hw_line"
+    done <<< "$HARDWARE_REPORT"
+else
+    warn "hardware detection is not available in this checkout yet; continuing"
+fi
+
+# --------------------------------------------------------------------------- #
 #  Session type (Wayland warning)
 # --------------------------------------------------------------------------- #
 SESSION="${XDG_SESSION_TYPE:-}"

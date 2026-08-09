@@ -786,6 +786,74 @@ def test_unknown_free_space_does_not_block_the_install(bash, source):
 
 
 # --------------------------------------------------------------------------- #
+#  Hardware detection report ("jarvis hardware", advisory only)
+#
+#  This step prints what jarvis.core.hardware / jarvis.llm.planner see so the
+#  download-plan numbers further down have context. It must never become a
+#  second place that decides *which* model or backend gets used -- that
+#  remains MAIN_TAG/FAST_TAG/runtime_py, computed independently, later. These
+#  tests prove the step is provably additive: it exists, runs before the venv,
+#  and neither reads nor sets any variable the download plan depends on.
+# --------------------------------------------------------------------------- #
+def test_the_hardware_report_step_exists_and_runs_before_the_venv(lines):
+    report = next(
+        i for i, line in enumerate(lines) if 'step "Detecting hardware"' in line
+    )
+    venv = next(
+        i for i, line in enumerate(lines) if 'step "Creating the virtual environment' in line
+    )
+    libs = next(
+        i for i, line in enumerate(lines) if 'step "Checking system libraries"' in line
+    )
+    assert libs < report < venv, (
+        "the hardware report must run after the system-libraries check and "
+        "before the virtual environment is created"
+    )
+
+
+def test_the_hardware_report_uses_the_bare_interpreter_not_the_venv_one(source):
+    """It runs before $VPY exists, so it must invoke $PYTHON instead."""
+    block = _extract_block(source, 'step "Detecting hardware"')
+    assert '"$PYTHON" -m jarvis hardware' in block
+    assert "$VPY" not in block
+
+
+def test_the_hardware_report_step_touches_no_download_plan_variable(source):
+    """A report, not a second place that decides what gets downloaded."""
+    block = _extract_block(source, 'step "Detecting hardware"')
+    for forbidden in ("MAIN_TAG", "FAST_TAG", "MODEL_ID", "require_disk_space", "runtime_py"):
+        assert forbidden not in block, (
+            f"the hardware report step references {forbidden!r}; it must stay "
+            f"report-only and never influence model/backend selection"
+        )
+
+
+def test_the_hardware_report_degrades_to_a_note_rather_than_aborting(bash, source):
+    """A checkout without the hardware/planner modules must not fail the install."""
+    block = _extract_block(source, 'step "Detecting hardware"')
+    snippet = "\n".join([
+        STUBS,
+        'PYTHON="__does_not_exist_on_path__"',
+        block,
+        "echo AFTER_HARDWARE_STEP",
+    ])
+    result = _run(bash, snippet)
+    assert result.returncode == 0, result.stderr
+    assert "AFTER_HARDWARE_STEP" in result.stdout, (
+        "a failing/absent hardware report must not stop the script"
+    )
+    assert "WARN" in result.stdout
+
+
+def test_the_download_plan_decision_points_are_unchanged(source):
+    """The exact lines the rest of the suite already exercises, byte for byte."""
+    assert 'FAST_TAG="qwen3:4b-instruct-2507-q4_K_M"' in source
+    assert 'MAIN_TAG="$(runtime_capture resolve-tag "$MODEL_ID")"' in source
+    assert 'MAIN_TAG="$(runtime_capture configured-tag)"' in source
+    assert 'step "Download plan"' in source
+
+
+# --------------------------------------------------------------------------- #
 #  The summary
 # --------------------------------------------------------------------------- #
 def test_every_component_reports_a_line(source):

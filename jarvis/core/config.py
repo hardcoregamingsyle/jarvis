@@ -267,6 +267,21 @@ class WindowsConfig:
 
 
 @dataclass
+class HardwareConfig:
+    """Manual hardware overrides. Auto-detected by default (see jarvis.core.hardware and
+    jarvis.llm.planner) -- every field here exists to be overridden, not to be filled in by a
+    typical user. mode="manual" disables auto-detection entirely and trusts these values as-is,
+    which matters on a machine where detection guesses wrong (a headless VM passing through a
+    GPU that nvidia-smi cannot see, a container with a fake /proc/meminfo, etc.)."""
+
+    mode: str = "auto"              # "auto" | "manual"
+    accelerator: str = "auto"       # "auto" | "cuda" | "rocm" | "mps" | "tpu" | "cpu"
+    vram_gb: float = 0.0            # 0 = auto-detect
+    ram_gb: float = 0.0             # 0 = auto-detect
+    gpu_count: int = 0              # 0 = auto-detect
+
+
+@dataclass
 class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     stt: STTConfig = field(default_factory=STTConfig)
@@ -276,6 +291,7 @@ class Config:
     security: SecurityConfig = field(default_factory=SecurityConfig)
     voice: VoiceConfig = field(default_factory=VoiceConfig)
     windows: WindowsConfig = field(default_factory=WindowsConfig)
+    hardware: HardwareConfig = field(default_factory=HardwareConfig)
     data_dir: str = ""
     log_level: str = "INFO"
 
@@ -503,5 +519,6 @@ def load_config(
 __all__ = [
     "Config", "LLMConfig", "STTConfig", "TTSConfig", "MemoryConfig",
     "AgentConfig", "SecurityConfig", "VoiceConfig", "WindowsConfig",
+    "HardwareConfig",
     "load_config", "default_config_paths", "HF_TOKEN_ENV_VARS",
 ]
