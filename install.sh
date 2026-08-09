@@ -246,6 +246,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 CHANGED, FAILED, CURRENT, SKIPPED, ABSENT = 0, 1, 3, 4, 5
 
@@ -259,9 +260,90 @@ FETCHED = ("pulled", "fetched", "downloaded", "installed", "upgraded", "written"
 #: ...and the ones that mean it was already there.
 UNCHANGED = ("present", "current", "skipped", "already-running", "external")
 
+#: True while the last thing written to stderr was an unterminated \r
+#: progress line, so say() knows to start its own line cleanly rather than
+#: overwriting the tail of a progress bar.
+_PROGRESS_LINE_OPEN = [False]
+
 
 def say(text):
+    if _PROGRESS_LINE_OPEN[0]:
+        sys.stderr.write("\n")
+        _PROGRESS_LINE_OPEN[0] = False
     sys.stderr.write("    %s\n" % text)
+
+
+def make_progress():
+    """A throttled stderr progress printer for a multi-gigabyte transfer.
+
+    Without this, ensure_model()/install()/provision_all() ran in complete
+    silence for as long as the download took -- easily tens of minutes for a
+    16 GB model on an ordinary connection -- and a run that was working
+    perfectly looked identical to one that had hung after "checking space
+    available". jarvis.runtime already reports progress through the
+    `progress` callback every action below now accepts; nothing was ever
+    passing one in.
+
+    Throttled to roughly one update per second per (phase, tag) so a fast
+    local link does not flood the terminal with one line per network chunk.
+    """
+    is_tty = sys.stderr.isatty()
+    last = {}
+
+    def emit(event):
+        phase = str(event.get("phase") or "progress")
+        tag = str(event.get("tag") or "")
+        key = phase + ":" + tag
+        message = event.get("message")
+        completed = event.get("completed")
+        total = event.get("total")
+        percent = event.get("percent")
+        if percent is None and isinstance(completed, (int, float)) \
+                and isinstance(total, (int, float)) and total:
+            percent = round(completed * 100.0 / total, 1)
+        done = percent is not None and percent >= 100
+
+        now = time.monotonic()
+        prev_t, prev_p = last.get(key, (0.0, None))
+        first = key not in last
+        # A message ("pulling X (~16 GB)") always shows; numeric progress is
+        # throttled by time and by a minimum percent movement.
+        if not first and not message and not done:
+            if now - prev_t < 1.0 or (prev_p is not None and percent is not None
+                                      and abs(percent - prev_p) < 1):
+                return
+        last[key] = (now, percent)
+
+        label = phase if not tag else "%s %s" % (phase, tag)
+        if message:
+            line = "%-16s %s" % (label, message)
+        elif percent is not None:
+            have_gb = (completed or 0) / 1e9
+            want_gb = (total or 0) / 1e9
+            line = ("%-16s %5.1f%%  (%.2f / %.2f GB)" % (label, percent, have_gb, want_gb)
+                    if want_gb else "%-16s %5.1f%%" % (label, percent))
+        elif isinstance(completed, (int, float)) and completed:
+            line = "%-16s %.2f GB" % (label, completed / 1e9)
+        else:
+            return
+
+        if is_tty and not message:
+            sys.stderr.write("\r    " + line + " " * 8)
+            _PROGRESS_LINE_OPEN[0] = True
+            if done:
+                sys.stderr.write("\n")
+                _PROGRESS_LINE_OPEN[0] = False
+        else:
+            if _PROGRESS_LINE_OPEN[0]:
+                sys.stderr.write("\n")
+                _PROGRESS_LINE_OPEN[0] = False
+            sys.stderr.write("    " + line + "\n")
+        sys.stderr.flush()
+
+    return emit
+
+
+PROGRESS = make_progress()
 
 
 def load_cfg():
@@ -370,7 +452,7 @@ def action_ollama():
             say("a newer ollama exists; left alone because --no-update was given")
             return CURRENT
     try:
-        result = rt.ollama.install(cfg)
+        result = rt.ollama.install(cfg, progress=PROGRESS)
     except Exception as exc:
         say("ollama.install failed: %s" % exc)
         return FAILED
@@ -411,7 +493,7 @@ def action_model():
         # re-quantised -- so "present" and "current" are different claims.
         # Ollama compares digests and transfers only changed layers, so this is
         # a manifest fetch when the model is already up to date.
-        result = rt.ollama.ensure_model(cfg, tag=ARG, refresh=UPDATE)
+        result = rt.ollama.ensure_model(cfg, tag=ARG, refresh=UPDATE, progress=PROGRESS)
     except Exception as exc:
         say("ensure_model failed: %s" % exc)
         return FAILED
@@ -428,7 +510,7 @@ def action_assets():
         return ABSENT
     cfg = load_cfg()
     try:
-        result = rt.assets.provision_all(cfg, skip=["ollama", "model"])
+        result = rt.assets.provision_all(cfg, skip=["ollama", "model"], progress=PROGRESS)
     except Exception as exc:
         say("provision_all failed: %s" % exc)
         return FAILED

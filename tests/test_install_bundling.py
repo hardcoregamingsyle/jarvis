@@ -1273,3 +1273,280 @@ def test_speech_assets_fall_back_to_the_old_setup_command(source):
         "when jarvis.runtime is absent the voice download must fall back to "
         "the behaviour that has always worked"
     )
+
+
+# --------------------------------------------------------------------------- #
+#  Progress during a multi-gigabyte download
+#
+#  install(), ensure_model() and provision_all() all accept a `progress`
+#  callback and report through it as bytes move -- but nothing in the bridge
+#  ever passed one, so a real download produced ZERO terminal output for
+#  however long it took. A 16 GB pull on an ordinary connection is easily
+#  twenty minutes of total silence after "checking space available", which is
+#  indistinguishable from a hang. These tests prove the callback is real, is
+#  actually wired to the three calls that can be large, and turns into
+#  visible, throttled output rather than either silence or a flood.
+# --------------------------------------------------------------------------- #
+def test_the_bridge_defines_a_progress_printer(bridge):
+    assert "def make_progress" in bridge
+    assert re.search(r"^PROGRESS\s*=\s*make_progress\(\)", bridge, re.M), (
+        "make_progress() is defined but never instantiated at module scope"
+    )
+
+
+@pytest.mark.parametrize("call,keyword", [
+    ("rt.ollama.install(cfg", "progress=PROGRESS"),
+    ("rt.ollama.ensure_model(cfg", "progress=PROGRESS"),
+    ("rt.assets.provision_all(cfg", "progress=PROGRESS"),
+])
+def test_every_large_download_is_given_the_progress_callback(bridge, call, keyword):
+    line = next((l for l in bridge.splitlines() if call in l), None)
+    assert line is not None, f"call site {call!r} not found in the bridge"
+    assert keyword in line, (
+        f"{line.strip()!r} does not pass {keyword} -- this download will run "
+        f"in total silence"
+    )
+
+
+#: A stub whose install/ensure_model/provision_all actually DRIVE the caller's
+#: progress function with realistic events, so the bridge's own printer can be
+#: exercised for real rather than merely proven present.
+STUB_RUNTIME_WITH_LIVE_PROGRESS = (
+    "def _feed(progress):\n"
+    "    if progress is None:\n"
+    "        raise AssertionError('no progress callback was passed')\n"
+    "    if not callable(progress):\n"
+    "        raise AssertionError('progress is not callable: %r' % (progress,))\n"
+    "    progress({'phase': 'pull', 'tag': 'm:1', 'message': 'pulling m:1 (~16 GB)'})\n"
+    "    for i in range(0, 101, 25):\n"
+    "        progress({'phase': 'pull', 'tag': 'm:1',\n"
+    "                  'completed': i * 160_000_000, 'total': 16_000_000_000,\n"
+    "                  'percent': float(i)})\n"
+    "\n"
+    "\n"
+    "class _Ollama:\n"
+    "    def install_plan(self, cfg=None):\n"
+    "        return {'action': 'install', 'reason': 'planned'}\n"
+    "\n"
+    "    def install(self, cfg=None, progress=None, **kw):\n"
+    "        _feed(progress)\n"
+    "        return {'ok': True, 'action': 'installed', 'installed_now': True}\n"
+    "\n"
+    "    def start_server(self, cfg=None, **kw):\n"
+    "        return {'ok': True, 'action': 'already-running'}\n"
+    "\n"
+    "    def ensure_model(self, cfg=None, *, tag=None, progress=None, **kw):\n"
+    "        _feed(progress)\n"
+    "        return {'ok': True, 'action': 'pulled', 'reason': 'm:1 pulled (success).'}\n"
+    "\n"
+    "    def install_service(self, cfg=None, **kw):\n"
+    "        return {'ok': True, 'written': True, 'enabled': True, 'path': '/u'}\n"
+    "\n"
+    "\n"
+    "ollama = _Ollama()\n"
+    "\n"
+    "\n"
+    "class _Assets:\n"
+    "    def provision_all(self, cfg=None, progress=None, **kw):\n"
+    "        _feed(progress)\n"
+    "        return {'ok': True, 'summary': [], 'components':\n"
+    "                {'voice': {'action': 'present'}, 'stt': {'action': 'present'}}}\n"
+    "\n"
+    "\n"
+    "assets = _Assets()\n"
+    "\n"
+    "\n"
+    "def status(cfg=None):\n"
+    "    return {'ready': False, 'missing': [], 'ollama': {}}\n"
+)
+
+
+@pytest.mark.parametrize("action,arg", [
+    ("ollama", ""),
+    ("model", "m:1"),
+    ("assets", ""),
+])
+def test_progress_reaches_the_callback_and_becomes_visible_output(
+        bridge, tmp_path, action, arg):
+    """End to end: a stub that behaves like a real multi-gigabyte pull.
+
+    If this callback were still missing, the stub's own AssertionError
+    ("no progress callback was passed") would surface as a FAILED exit code --
+    so a regression here is caught even without inspecting stderr. The stderr
+    assertions on top of that prove the output is not just present but
+    actually informative: a percentage and a GB figure the owner can watch.
+    """
+    stubs = _stub_runtime(tmp_path, STUB_RUNTIME_WITH_LIVE_PROGRESS)
+    env = {"JARVIS_RT_ACTION": action, "JARVIS_RT_ARG": arg,
+           "JARVIS_RT_UPDATE": "1", "JARVIS_RT_CONFIG": ""}
+    result = _run_embedded(bridge, tmp_path, env=env, extra_path=stubs)
+
+    # FAILED (1) is exactly the code the stub's own "no progress callback was
+    # passed" AssertionError produces, via the bridge's catch-all handler --
+    # so this alone would catch the callback going missing again. The exact
+    # non-failure code differs by action (assets reports CURRENT when its
+    # components are merely "present", not freshly fetched), which is correct
+    # and not what this test is about.
+    assert result.returncode != FAILED, (
+        f"the stub's own progress-callback assertion failed:\n{result.stderr}"
+    )
+    assert "16.00 GB" in result.stderr or "16 GB" in result.stderr, (
+        f"no size information reached the terminal:\n{result.stderr!r}"
+    )
+    assert "%" in result.stderr, f"no percentage reached the terminal:\n{result.stderr!r}"
+
+
+def test_progress_output_is_throttled_not_flooded(bridge, tmp_path):
+    """A fast local link must not turn into one printed line per chunk."""
+    stub = (
+        "class _Ollama:\n"
+        "    def install_plan(self, cfg=None):\n"
+        "        return {'action': 'install', 'reason': 'planned'}\n"
+        "\n"
+        "    def install(self, cfg=None, progress=None, **kw):\n"
+        "        for i in range(500):\n"
+        "            progress({'phase': 'download', 'completed': i * 1_000_000,\n"
+        "                      'total': 500_000_000})\n"
+        "        return {'ok': True, 'action': 'installed', 'installed_now': True}\n"
+        "\n"
+        "    def start_server(self, cfg=None, **kw):\n"
+        "        return {'ok': True, 'action': 'already-running'}\n"
+        "\n"
+        "    def ensure_model(self, cfg=None, *, tag=None, progress=None, **kw):\n"
+        "        return {'ok': True, 'action': 'present'}\n"
+        "\n"
+        "    def install_service(self, cfg=None, **kw):\n"
+        "        return {'ok': True, 'written': True, 'enabled': True, 'path': '/u'}\n"
+        "\n"
+        "\n"
+        "ollama = _Ollama()\n"
+        "\n"
+        "\n"
+        "class _Assets:\n"
+        "    def provision_all(self, cfg=None, progress=None, **kw):\n"
+        "        return {'ok': True, 'summary': [], 'components': {}}\n"
+        "\n"
+        "\n"
+        "assets = _Assets()\n"
+        "\n"
+        "\n"
+        "def status(cfg=None):\n"
+        "    return {'ready': False, 'missing': [], 'ollama': {}}\n"
+    )
+    stubs = _stub_runtime(tmp_path, stub)
+    env = {"JARVIS_RT_ACTION": "ollama", "JARVIS_RT_ARG": "",
+           "JARVIS_RT_UPDATE": "1", "JARVIS_RT_CONFIG": ""}
+    result = _run_embedded(bridge, tmp_path, env=env, extra_path=stubs)
+
+    assert result.returncode == CHANGED, result.stderr
+    lines = [l for l in result.stderr.splitlines() if l.strip()]
+    assert len(lines) < 20, (
+        f"500 events produced {len(lines)} printed lines -- the throttle is "
+        f"not throttling:\n{result.stderr[:2000]}"
+    )
+    assert len(lines) >= 1, "500 real progress events produced no output at all"
+
+
+# --------------------------------------------------------------------------- #
+#  The progress printer's own logic, unit-tested in-process
+# --------------------------------------------------------------------------- #
+def _bridge_definitions(bridge_src: str) -> dict:
+    """Exec everything up to the dispatcher, so make_progress()/say() can be
+    called directly without going through a subprocess or triggering an
+    actual runtime action."""
+    cut = bridge_src.index("handler = ACTIONS.get(ACTION)")
+    namespace: dict = {"__name__": "bridge_defs"}
+    exec(compile(bridge_src[:cut], "<bridge>", "exec"), namespace)
+    return namespace
+
+
+class _FakeStream:
+    def __init__(self, is_tty: bool) -> None:
+        self._is_tty = is_tty
+        self.chunks: List[str] = []
+
+    def isatty(self) -> bool:
+        return self._is_tty
+
+    def write(self, text: str) -> int:
+        self.chunks.append(text)
+        return len(text)
+
+    def flush(self) -> None:
+        pass
+
+    @property
+    def text(self) -> str:
+        return "".join(self.chunks)
+
+
+def test_make_progress_throttles_by_time_and_by_percent_movement(bridge, monkeypatch):
+    ns = _bridge_definitions(bridge)
+    fake = _FakeStream(is_tty=False)
+    monkeypatch.setattr(ns["sys"], "stderr", fake)
+
+    clock = [0.0]
+    monkeypatch.setattr(ns["time"], "monotonic", lambda: clock[0])
+
+    emit = ns["make_progress"]()
+    for i in range(0, 40, 2):
+        emit({"phase": "pull", "tag": "m", "completed": i * 1_000_000, "total": 100_000_000})
+    printed_before = fake.text.count("\n")
+
+    clock[0] += 1.5
+    emit({"phase": "pull", "tag": "m", "completed": 60_000_000, "total": 100_000_000})
+    printed_after = fake.text.count("\n")
+
+    assert printed_before == 1, (
+        f"a burst of same-second events should print once (the first), got "
+        f"{printed_before} lines"
+    )
+    assert printed_after == 2, "a new event after the throttle window did not print"
+
+
+def test_make_progress_always_shows_a_message_event(bridge, monkeypatch):
+    """"pulling X (~16 GB)" must appear even right after a numeric update --
+    it is rare and informative, never spam."""
+    ns = _bridge_definitions(bridge)
+    fake = _FakeStream(is_tty=False)
+    monkeypatch.setattr(ns["sys"], "stderr", fake)
+    clock = [0.0]
+    monkeypatch.setattr(ns["time"], "monotonic", lambda: clock[0])
+
+    emit = ns["make_progress"]()
+    emit({"phase": "model", "message": "pulling m:1 (~16 GB)"})
+    emit({"phase": "model", "message": "pulling m:1 (~16 GB)"})
+
+    assert fake.text.count("pulling m:1") == 2
+
+
+def test_say_starts_a_fresh_line_after_an_open_tty_progress_bar(bridge, monkeypatch):
+    """On a real terminal, progress overwrites itself with \\r. A say() call
+    arriving mid-transfer must not get smeared onto the tail of that line."""
+    ns = _bridge_definitions(bridge)
+    fake = _FakeStream(is_tty=True)
+    monkeypatch.setattr(ns["sys"], "stderr", fake)
+
+    emit = ns["make_progress"]()
+    emit({"phase": "pull", "tag": "m", "completed": 500, "total": 1000, "percent": 50.0})
+    assert "\r" in fake.text and not fake.text.endswith("\n"), (
+        "setup assumption failed: the progress line should be open (no trailing \\n)"
+    )
+
+    ns["say"]("interrupting mid-transfer")
+    assert fake.text.endswith("\n    interrupting mid-transfer\n"), (
+        f"say() did not cleanly close the open progress line:\n{fake.text!r}"
+    )
+
+
+def test_make_progress_never_raises_on_a_malformed_event(bridge, monkeypatch):
+    """_notify() in jarvis.runtime already swallows a broken callback, but the
+    printer itself should not depend on that safety net."""
+    ns = _bridge_definitions(bridge)
+    fake = _FakeStream(is_tty=False)
+    monkeypatch.setattr(ns["sys"], "stderr", fake)
+    emit = ns["make_progress"]()
+
+    for garbage in ({}, {"phase": None}, {"completed": "not a number"},
+                    {"total": object()}, {"percent": float("nan")}):
+        emit(garbage)  # must not raise
