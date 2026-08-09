@@ -405,23 +405,38 @@ if [ "$WANT_LINK" -eq 1 ] && [ -x "$VENV_DIR/bin/jarvis" ]; then
     LINK="$LOCAL_BIN/jarvis"
 
     mkdir -p "$LOCAL_BIN"
-    # -ef compares device and inode through the symlink, so a re-run recognises
-    # its own link regardless of how the path was spelled. Comparing readlink
-    # output as a string fails on a relative link, or anywhere readlink is thin.
-    if [ -e "$LINK" ] && [ "$LINK" -ef "$VENV_DIR/bin/jarvis" ]; then
-        ok "already linked: $LINK"
-        JARVIS_ON_PATH=1
-    elif [ -e "$LINK" ] || [ -L "$LINK" ]; then
-        # Never clobber. Something else owning this name is the user's business.
-        warn "$LINK already exists and is not ours — leaving it untouched."
-        info "Run JARVIS directly instead: $VENV_DIR/bin/jarvis"
-    elif ln -s "$VENV_DIR/bin/jarvis" "$LINK" 2>/dev/null; then
-        ok "linked $LINK -> $VENV_DIR/bin/jarvis"
+
+    # Link one name. Returns 0 when the name ends up pointing at our console
+    # script, 1 otherwise.  -ef compares device and inode through the symlink,
+    # so a re-run recognises its own link regardless of how the path was
+    # spelled; comparing readlink output as a string breaks on a relative link.
+    link_one() {
+        local target="$1" link="$2"
+        if [ -e "$link" ] && [ "$link" -ef "$target" ]; then
+            ok "already linked: $link"
+            return 0
+        elif [ -e "$link" ] || [ -L "$link" ]; then
+            # Never clobber. Another tool owning this name is the user's business.
+            warn "$link already exists and is not ours — leaving it untouched."
+            return 1
+        elif ln -s "$target" "$link" 2>/dev/null; then
+            ok "linked $link -> $target"
+            return 0
+        fi
+        warn "could not create $link"
+        return 1
+    }
+
+    if link_one "$VENV_DIR/bin/jarvis" "$LINK"; then
         JARVIS_ON_PATH=1
     else
-        warn "could not create $LINK"
         info "Run JARVIS directly instead: $VENV_DIR/bin/jarvis"
     fi
+
+    # Linux filenames are case-sensitive, so `JARVIS` is a different command
+    # from `jarvis` and would otherwise be "command not found" for a program
+    # whose name is written in capitals everywhere. Link both spellings.
+    link_one "$VENV_DIR/bin/jarvis" "$LOCAL_BIN/JARVIS" >/dev/null 2>&1 || true
 
     if [ "$JARVIS_ON_PATH" -eq 1 ]; then
         case ":${PATH:-}:" in
