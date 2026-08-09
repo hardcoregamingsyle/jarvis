@@ -10,10 +10,13 @@
 #   ./install.sh --service       install + enable the systemd *user* service
 #   ./install.sh --vllm          set up the vLLM path (Linux-only, separate install)
 #   ./install.sh --model ID      write ID into config.yaml as the model to use
+#   ./install.sh --no-link       do not symlink ~/.local/bin/jarvis
 #
-# Nothing here deletes, moves or overwrites anything outside this directory,
-# and nothing is run with sudo — where a system package is needed the exact
-# command is printed for you to run yourself.
+# Nothing here deletes, moves or overwrites anything, and nothing is run with
+# sudo — where a system package is needed the exact command is printed for you
+# to run yourself.  The only thing written outside this directory is a single
+# symlink at ~/.local/bin/jarvis so that `jarvis` works as a bare command; it
+# is never created over the top of an existing file.  Pass --no-link to skip it.
 #
 set -euo pipefail
 
@@ -25,6 +28,7 @@ DOWNLOAD_VOICE=1
 VENV=".venv"
 WANT_SERVICE=0
 WANT_VLLM=0
+WANT_LINK=1
 MODEL_ID=""
 
 while [ $# -gt 0 ]; do
@@ -35,6 +39,7 @@ while [ $# -gt 0 ]; do
         --no-voice) DOWNLOAD_VOICE=0 ;;
         --service) WANT_SERVICE=1 ;;
         --vllm) WANT_VLLM=1 ;;
+        --no-link) WANT_LINK=0 ;;
         --model)
             if [ $# -lt 2 ]; then echo "--model requires a model id" >&2; exit 1; fi
             MODEL_ID="$2"; shift
@@ -43,7 +48,7 @@ while [ $# -gt 0 ]; do
             if [ $# -lt 2 ]; then echo "--venv requires a path" >&2; exit 1; fi
             VENV="$2"; shift
             ;;
-        -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
     shift
@@ -384,6 +389,63 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
+#  Put `jarvis` on the PATH
+#
+#  The console script lives inside the virtualenv, so without this the obvious
+#  thing to type — `jarvis doctor`, which is what the README says everywhere —
+#  answers "command not found" on a successful install.  A symlink in
+#  ~/.local/bin is the fix: it is the freedesktop-blessed location for
+#  per-user executables, needs no sudo, and is already on PATH on Debian,
+#  Ubuntu, Fedora and Arch.
+# --------------------------------------------------------------------------- #
+JARVIS_ON_PATH=0
+if [ "$WANT_LINK" -eq 1 ] && [ -x "$VENV_DIR/bin/jarvis" ]; then
+    step "Putting 'jarvis' on your PATH"
+    LOCAL_BIN="${XDG_BIN_HOME:-$HOME/.local/bin}"
+    LINK="$LOCAL_BIN/jarvis"
+
+    mkdir -p "$LOCAL_BIN"
+    # -ef compares device and inode through the symlink, so a re-run recognises
+    # its own link regardless of how the path was spelled. Comparing readlink
+    # output as a string fails on a relative link, or anywhere readlink is thin.
+    if [ -e "$LINK" ] && [ "$LINK" -ef "$VENV_DIR/bin/jarvis" ]; then
+        ok "already linked: $LINK"
+        JARVIS_ON_PATH=1
+    elif [ -e "$LINK" ] || [ -L "$LINK" ]; then
+        # Never clobber. Something else owning this name is the user's business.
+        warn "$LINK already exists and is not ours — leaving it untouched."
+        info "Run JARVIS directly instead: $VENV_DIR/bin/jarvis"
+    elif ln -s "$VENV_DIR/bin/jarvis" "$LINK" 2>/dev/null; then
+        ok "linked $LINK -> $VENV_DIR/bin/jarvis"
+        JARVIS_ON_PATH=1
+    else
+        warn "could not create $LINK"
+        info "Run JARVIS directly instead: $VENV_DIR/bin/jarvis"
+    fi
+
+    if [ "$JARVIS_ON_PATH" -eq 1 ]; then
+        case ":${PATH:-}:" in
+            *":$LOCAL_BIN:"*)
+                ok "$LOCAL_BIN is on your PATH — 'jarvis' will work"
+                ;;
+            *)
+                # Debian and Ubuntu add ~/.local/bin from ~/.profile only when
+                # the directory already existed at login. If this run created
+                # it, PATH will not pick it up until the next login — which is
+                # exactly when "it installed fine but the command is missing"
+                # gets blamed on the installer.
+                JARVIS_ON_PATH=0
+                warn "$LOCAL_BIN is not on your PATH in this shell."
+                warn "Most distributions add it at login, but only if it already"
+                warn "existed — and this run may have just created it."
+                info "For this shell:   export PATH=\"$LOCAL_BIN:\$PATH\""
+                info "Permanently:      log out and back in, or run: exec \$SHELL -l"
+                ;;
+        esac
+    fi
+fi
+
+# --------------------------------------------------------------------------- #
 #  Model selection
 # --------------------------------------------------------------------------- #
 if [ -n "$MODEL_ID" ]; then
@@ -489,17 +551,27 @@ fi
 # --------------------------------------------------------------------------- #
 #  Done
 # --------------------------------------------------------------------------- #
+# Print the invocation the user can actually type, not the one we wish worked.
+if [ "$JARVIS_ON_PATH" -eq 1 ]; then
+    RUN_AS="jarvis"
+    PATH_NOTE=""
+else
+    RUN_AS="$JARVIS_BIN"
+    PATH_NOTE="
+  'jarvis' on its own is not on your PATH yet. Either:
+      export PATH=\"\$HOME/.local/bin:\$PATH\"     # add to ~/.bashrc to persist
+      source $VENV_DIR/bin/activate           # or activate the virtualenv"
+fi
+
 printf "\n${GREEN}==> Installed.${RESET}\n"
 cat <<EOF
 
 ${DIM}  Try it:
-      $JARVIS_BIN doctor        check what is installed
-      $JARVIS_BIN say           audition the British voice
-      $JARVIS_BIN chat          talk to it by keyboard
-      $JARVIS_BIN voice         hands-free
-
-  Or activate the environment once and just type 'jarvis':
-      source $VENV_DIR/bin/activate
+      $RUN_AS doctor        check what is installed
+      $RUN_AS say           audition the British voice
+      $RUN_AS chat          talk to it by keyboard
+      $RUN_AS voice         hands-free
+$PATH_NOTE
 
   A local language model is required for conversation. The quickest route:
       curl -fsSL https://ollama.com/install.sh | sh

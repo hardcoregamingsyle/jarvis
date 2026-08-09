@@ -237,6 +237,64 @@ def test_the_sudo_detector_would_actually_catch_a_real_call():
     )
 
 
+# --------------------------------------------------------------------------- #
+#  `jarvis` must work as a bare command
+#
+#  The console script lives inside the virtualenv, so a perfectly successful
+#  install left `jarvis doctor` — the invocation the README uses everywhere —
+#  answering "command not found". The installer now symlinks ~/.local/bin/jarvis.
+# --------------------------------------------------------------------------- #
+def test_the_installer_puts_jarvis_on_the_path(source):
+    assert ".local/bin" in source, (
+        "install.sh never puts the console script anywhere on PATH, so a "
+        "successful install still leaves `jarvis` as command-not-found"
+    )
+    assert "ln -s" in source
+
+
+def test_the_symlink_never_clobbers_an_existing_file(source):
+    """~/.local/bin is shared with everything else the user installs."""
+    assert re.search(r'\[\s*-e\s+"\$LINK"\s*\]\s*\|\|\s*\[\s*-L\s+"\$LINK"\s*\]', source), (
+        "no guard against an existing ~/.local/bin/jarvis; the installer must "
+        "never overwrite something another tool owns"
+    )
+    assert "ln -sf" not in source, "-f would clobber silently"
+
+
+def test_the_link_check_uses_inode_comparison(source):
+    """A re-run must recognise its own link rather than warn about it."""
+    assert "-ef" in source, (
+        "the already-linked check should compare inodes with -ef; comparing "
+        "readlink output as a string breaks on a relative link"
+    )
+
+
+def test_the_path_situation_is_reported_not_assumed(source):
+    """Creating ~/.local/bin does not put it on PATH until the next login.
+
+    Debian and Ubuntu add it from ~/.profile only when it already existed at
+    login, so an installer that creates it and then claims `jarvis` works is
+    wrong precisely on a fresh machine — the case that matters.
+    """
+    assert "JARVIS_ON_PATH" in source
+    assert re.search(r'case\s+":\$\{?PATH', source), "PATH membership is never actually tested"
+    assert "export PATH=" in source, "no recovery instruction when it is not on PATH"
+
+
+def test_no_link_flag_exists_and_is_documented(source):
+    assert "--no-link" in source
+    assert re.search(r'--no-link\)\s*WANT_LINK=0', source), "--no-link is documented but not parsed"
+
+
+def test_the_header_promise_matches_what_it_actually_writes(source):
+    """The header used to promise nothing outside the directory is written."""
+    header = source.split("set -euo pipefail")[0]
+    assert "~/.local/bin/jarvis" in header, (
+        "the installer writes a symlink outside the repository; the header must "
+        "say so rather than promising it touches nothing outside this directory"
+    )
+
+
 def test_help_lists_every_flag_the_parser_accepts(source):
     """A documented-flag/real-flag mismatch sends people down blind alleys."""
     parsed = set(re.findall(r'^\s*(--[a-z-]+)\)', source, re.M))

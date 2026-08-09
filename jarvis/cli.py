@@ -10,17 +10,22 @@
     jarvis tools           # list registered tools
     jarvis memory          # inspect / search long-term memory
     jarvis setup           # download the voice model and check dependencies
+    jarvis serve           # browser client, so another device can talk to this JARVIS
 """
 
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import logging
+import os
+import secrets
+import socket
 import sys
 import textwrap
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Tuple
 
 from .core.config import Config, load_config
 from .core.logging_setup import setup_logging
@@ -350,6 +355,240 @@ def cmd_voice(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- #
+#  Remote access
+# --------------------------------------------------------------------------- #
+DEFAULT_SERVE_HOST = "127.0.0.1"
+DEFAULT_SERVE_PORT = 8765
+TOKEN_ENV_VAR = "JARVIS_SERVER_TOKEN"
+TOKEN_FILE_NAME = "server_token"
+
+# How a token was obtained, phrased for the operator.  The value is never
+# printed for any of these — only for a token generated during this run.
+_TOKEN_SOURCES = {
+    "flag": "--token",
+    "environment": f"${TOKEN_ENV_VAR}",
+    "config": "the configuration file",
+    "file": "the saved token file",
+}
+
+
+def _is_loopback(host: str) -> bool:
+    """True when *host* can only be reached from this machine.
+
+    Anything that is not demonstrably loopback — a wildcard bind, a LAN
+    address, a hostname this function cannot resolve to an IP literal — is
+    reported as reachable from elsewhere, because guessing the other way would
+    silently drop the token requirement.
+    """
+    candidate = (host or "").strip().strip("[]")
+    if not candidate:
+        return False
+    if candidate.lower() in ("localhost", "localhost.localdomain"):
+        return True
+    try:
+        return ipaddress.ip_address(candidate).is_loopback
+    except ValueError:
+        return False
+
+
+def _lan_address() -> Optional[str]:
+    """Best-effort LAN address of this machine, or ``None``.
+
+    Asks the kernel which local address it would use to reach an off-link
+    destination.  The socket is never sent on and the address used is RFC 5737
+    documentation space, so this neither transmits anything nor needs the
+    network to be up.
+    """
+    address = ""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.settimeout(0.2)
+            probe.connect(("192.0.2.1", 9))
+            address = probe.getsockname()[0]
+    except OSError:
+        address = ""
+    if address and not address.startswith("127."):
+        return address
+    try:
+        resolved = socket.gethostbyname(socket.gethostname())
+    except OSError:
+        return None
+    return resolved if resolved and not resolved.startswith("127.") else None
+
+
+def _url_host(host: str) -> str:
+    """Turn a bind address into something that can go in a URL.
+
+    ``0.0.0.0`` is a bind address, not a destination: nothing can connect to
+    it, so it becomes the LAN address when one can be found and loopback
+    otherwise.  IPv6 literals gain the brackets a URL requires.
+    """
+    candidate = (host or "").strip().strip("[]")
+    try:
+        parsed = ipaddress.ip_address(candidate)
+    except ValueError:
+        return candidate or DEFAULT_SERVE_HOST
+    if parsed.is_unspecified:
+        return _lan_address() or DEFAULT_SERVE_HOST
+    if parsed.version == 6:
+        return f"[{candidate}]"
+    return candidate
+
+
+def _serve_url(host: str, port: int, tls: bool = False) -> str:
+    """The URL a browser should open for this bind."""
+    return f"{'https' if tls else 'http'}://{_url_host(host)}:{port}"
+
+
+def _token_file(cfg: Config) -> Path:
+    return cfg.path(TOKEN_FILE_NAME)
+
+
+def _resolve_token(
+    cfg: Config,
+    requested: Optional[str] = None,
+    *,
+    environ: Optional[dict] = None,
+) -> Tuple[str, str]:
+    """Find the shared token, generating and saving one if there is none.
+
+    Returns ``(token, source)``.  ``source`` is ``"generated"`` only when the
+    token was created during this call, which is the one case where printing it
+    is the whole point; every other source is already known to the operator and
+    the value stays out of the terminal and the logs.
+
+    An explicitly empty ``--token`` means "no token", and is honoured — the
+    caller decides whether that is acceptable for the chosen bind address.
+    """
+    if requested is not None:
+        stripped = requested.strip()
+        return (stripped, "flag") if stripped else ("", "none")
+
+    environ = environ if environ is not None else os.environ
+    from_env = (environ.get(TOKEN_ENV_VAR) or "").strip()
+    if from_env:
+        return from_env, "environment"
+
+    server_cfg = getattr(cfg, "server", None)
+    from_cfg = (getattr(server_cfg, "token", "") or "").strip()
+    if from_cfg:
+        return from_cfg, "config"
+
+    path = _token_file(cfg)
+    try:
+        saved = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        saved = ""
+    if saved:
+        return saved, "file"
+
+    token = secrets.token_urlsafe(32)
+    try:
+        path.write_text(token + "\n", encoding="utf-8")
+        os.chmod(path, 0o600)
+    except OSError as exc:  # noqa: BLE001
+        # A token that cannot be saved still works for this run.
+        log.warning("could not save the server token to %s: %s", path, exc)
+    return token, "generated"
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    """Serve the browser client, so another device can talk to *this* JARVIS.
+
+    The assistant, its tools, its memory and its machine control all stay here.
+    The other device runs nothing but a browser: it captures microphone audio
+    locally and plays the reply locally, which is the only arrangement where
+    speaking into a laptop in another room reaches the right microphone.
+    """
+    host = (args.host or DEFAULT_SERVE_HOST).strip()
+    port = int(args.port)
+
+    if bool(args.cert) != bool(args.key):
+        _out("TLS needs both --cert and --key; only one was given.")
+        return 2
+    tls = bool(args.cert and args.key)
+
+    if args.print_url:
+        # Scripting hook: say where the server would be, bind nothing, exit 0.
+        _out(_serve_url(host, port, tls))
+        return 0
+
+    cfg = _load(args)
+    loopback = _is_loopback(host)
+    token, source = _resolve_token(cfg, args.token)
+
+    if not token and not loopback:
+        _out(f"Refusing to bind {host}:{port} with no token.")
+        _out("")
+        _out("JARVIS has full run of this machine by design — any file, any command,")
+        _out("the desktop itself. On a loopback bind that reach stops at this machine.")
+        _out(f"On {host} it does not: whatever can open the port gets the same access")
+        _out("you have. A shared token is what keeps other people out.")
+        _out("")
+        _out("Either drop the empty --token, or keep the bind on 127.0.0.1 and reach it")
+        _out("through SSH from the other device:")
+        _out(f"  ssh -N -L {port}:127.0.0.1:{port} user@this-machine")
+        _out("")
+        _out("docs/REMOTE_ACCESS.md walks through both.")
+        return 2
+
+    try:
+        from .server import serve as serve_forever
+    except ImportError as exc:
+        _out("The remote-access server (jarvis.server) is not available in this copy.")
+        _out(f"  {exc}")
+        _out("")
+        _out("Until it is, another device can still reach JARVIS over plain SSH:")
+        _out("  ssh user@this-machine jarvis chat")
+        _out("See docs/REMOTE_ACCESS.md.")
+        return 1
+
+    _out(BANNER)
+    _out(f"  URL     {_serve_url(host, port, tls)}")
+    _out(f"  bind    {host}:{port}" + ("  (loopback — this machine only)" if loopback else ""))
+    if tls:
+        _out(f"  TLS     {args.cert}")
+
+    if not token:
+        _out("  token   none — loopback bind, so nothing off this machine can connect")
+    elif source == "generated":
+        _out(f"  token   {token}")
+        _out(f"          saved to {_token_file(cfg)}; the same one is reused next time")
+    else:
+        _out(f"  token   set, from {_TOKEN_SOURCES.get(source, source)}")
+
+    if not loopback:
+        lan = _lan_address()
+        if lan:
+            _out(f"  LAN     {'https' if tls else 'http'}://{lan}:{port}")
+        _out("")
+        _out("  This port is this machine. Whoever reaches it can read and write any")
+        _out("  file and run any command, exactly as you can. Prefer an SSH tunnel or")
+        _out("  Tailscale to opening a port on the router:")
+        _out(f"    ssh -N -L {port}:127.0.0.1:{port} user@{lan or 'this-machine'}")
+        if not tls:
+            _out("  A tunnel also makes the microphone work: browsers only grant it on")
+            _out("  https or localhost, and the tunnel makes this localhost on the client.")
+        _out("  docs/REMOTE_ACCESS.md")
+
+    _out("\n  Ctrl+C to stop.\n")
+
+    try:
+        serve_forever(cfg, host=host, port=port, token=token,
+                      certfile=args.cert, keyfile=args.key)
+    except KeyboardInterrupt:
+        _out("\nStopping.")
+    except OSError as exc:  # noqa: BLE001
+        from .llm.models import redact
+
+        _out(f"\nCould not serve on {host}:{port}: {redact(exc)}")
+        if getattr(exc, "errno", None) is not None:
+            _out("Another process may already hold that port; try --port.")
+        return 1
+    return 0
+
+
 def cmd_setup(args: argparse.Namespace) -> int:
     """Fetch the pieces that need downloading, and verify the result."""
     cfg = _load(args)
@@ -428,6 +667,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_mem.add_argument("--export", metavar="PATH", help="export everything to JSONL")
     p_mem.set_defaults(func=cmd_memory)
 
+    p_serve = sub.add_parser(
+        "serve",
+        help="serve the browser client so another device can talk to this JARVIS",
+    )
+    p_serve.add_argument(
+        "--host", default=DEFAULT_SERVE_HOST,
+        help=f"address to bind (default {DEFAULT_SERVE_HOST}: reachable only from "
+             f"this machine; 0.0.0.0 exposes it to the LAN and then a token is required)",
+    )
+    p_serve.add_argument(
+        "--port", type=int, default=DEFAULT_SERVE_PORT,
+        help=f"TCP port (default {DEFAULT_SERVE_PORT})",
+    )
+    p_serve.add_argument(
+        "--token",
+        help=f"shared token clients must present (default: ${TOKEN_ENV_VAR}, the "
+             f"config, the saved token file, or a freshly generated one)",
+    )
+    p_serve.add_argument("--cert", metavar="PEM", help="TLS certificate; needs --key")
+    p_serve.add_argument("--key", metavar="PEM", help="TLS private key; needs --cert")
+    p_serve.add_argument(
+        "--print-url", action="store_true",
+        help="print the URL and exit, without binding anything",
+    )
+    p_serve.set_defaults(func=cmd_serve)
+
     p_setup = sub.add_parser("setup", help="download models and verify the install")
     p_setup.add_argument("--no-download", action="store_true",
                          help="check only; do not fetch anything")
@@ -441,29 +706,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     if not getattr(args, "command", None):
-        # Bare `jarvis`: prefer voice, fall back to text.
+        # Bare `jarvis` is the hands-free assistant: microphone in, voice out.
+        # `jarvis chat` is the text-only conversation.
         args.command = "voice"
         args.func = cmd_voice
+        reason = ""
         try:
             cfg = load_config(getattr(args, "config", None))
-            from .speech.audio_io import AudioRecorder
-
-            if not AudioRecorder(cfg.stt).is_available():
-                args.func = cmd_chat
-        except Exception:  # noqa: BLE001
-            args.func = cmd_chat
-
-    try:
-        return int(args.func(args) or 0)
-    except KeyboardInterrupt:
-        _out("\nInterrupted.")
-        return 130
-    except Exception as exc:  # noqa: BLE001
-        log.exception("command failed")
-        _out(f"\nError: {exc}")
-        _out("Run 'jarvis doctor' for a diagnosis, or -v for a full traceback.")
-        return 1
-
-
-if __name__ == "__main__":  # pragma: no cover
-    sys.exit(main())
+       

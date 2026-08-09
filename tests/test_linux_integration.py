@@ -1325,8 +1325,17 @@ def test_install_sh_only_tells_you_to_run_real_subcommands():
     known = set(re.findall(r'add_parser\(\s*"([a-z][a-z0-9_-]*)"', cli_source))
     assert known, "could not read the subcommand list out of jarvis/cli.py"
 
+    # Comments are not advice — nobody types them. Scanning them anyway made
+    # this test fire on ordinary English: a comment reading ".../bin/jarvis so
+    # that it works" parses as the subcommand "so". Strip comment lines and
+    # keep the check strict on everything that is executed or printed.
+    executable_text = "\n".join(
+        line for line in installer_text().splitlines()
+        if not line.lstrip().startswith("#")
+    )
+
     used = set(
-        re.findall(r"(?:\./jarvis|/jarvis|-m jarvis)\s+([a-z][a-z0-9_-]*)", installer_text())
+        re.findall(r"(?:\./jarvis|/jarvis|-m jarvis)\s+([a-z][a-z0-9_-]*)", executable_text)
     )
     assert used, "the installer no longer mentions any jarvis subcommand"
     assert used <= known, f"install.sh names subcommands that do not exist: {sorted(used - known)}"
