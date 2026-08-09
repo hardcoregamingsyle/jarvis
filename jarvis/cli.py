@@ -485,8 +485,18 @@ def _resolve_token(
 
     token = secrets.token_urlsafe(32)
     try:
-        path.write_text(token + "\n", encoding="utf-8")
-        os.chmod(path, 0o600)
+        # Created 0600 by os.open rather than written and then chmod'ed: this
+        # token is full control of the machine, and the second form leaves it
+        # world-readable for the window between the two calls.
+        handle = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(handle, "w", encoding="utf-8") as fh:
+            fh.write(token + "\n")
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            # Windows and some filesystems will not take the mode; the file is
+            # still inside the owner's own profile directory.
+            log.debug("could not chmod 0600 %s", path, exc_info=True)
     except OSError as exc:  # noqa: BLE001
         # A token that cannot be saved still works for this run.
         log.warning("could not save the server token to %s: %s", path, exc)

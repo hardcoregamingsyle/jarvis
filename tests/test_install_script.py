@@ -252,13 +252,80 @@ def test_the_installer_puts_jarvis_on_the_path(source):
     assert "ln -s" in source
 
 
-def test_the_symlink_never_clobbers_an_existing_file(source):
-    """~/.local/bin is shared with everything else the user installs."""
-    assert re.search(r'\[\s*-e\s+"\$LINK"\s*\]\s*\|\|\s*\[\s*-L\s+"\$LINK"\s*\]', source), (
-        "no guard against an existing ~/.local/bin/jarvis; the installer must "
-        "never overwrite something another tool owns"
-    )
+def _extract_shell_function(source: str, name: str) -> str:
+    """Pull one function definition out of the script, brace-balanced.
+
+    Extracting and running the real function beats pattern-matching it: a regex
+    pins one spelling of one variable, so renaming a local — which is exactly
+    what happened when this linking code was refactored into link_one() — breaks
+    the test while the behaviour it guards is untouched.
+    """
+    start = re.search(rf'^\s*{re.escape(name)}\(\)\s*\{{', source, re.M)
+    assert start, f"no function {name}() in install.sh"
+    depth, out, i = 0, [], start.start()
+    for line in source[i:].splitlines(keepends=True):
+        out.append(line)
+        depth += line.count("{") - line.count("}")
+        if depth == 0 and len(out) > 1:
+            break
+    return "".join(out)
+
+
+def test_the_symlink_never_clobbers_an_existing_file(source, tmp_path):
+    """~/.local/bin is shared with everything else the user installs.
+
+    Exercised for real: the extracted function is run against a directory that
+    already contains a file under the target name, and the file must survive
+    byte for byte.
+    """
+    bash = _find_bash()
+    if not bash:
+        pytest.skip("bash unavailable")
+
     assert "ln -sf" not in source, "-f would clobber silently"
+
+    fn = _extract_shell_function(source, "link_one")
+    target = tmp_path / "console_script"
+    target.write_text("#!/bin/sh\necho jarvis\n", encoding="utf-8")
+    occupied = tmp_path / "occupied"
+    occupied.write_text("belongs to another tool", encoding="utf-8")
+
+    script = (
+        "ok() { :; }\nwarn() { :; }\n"
+        + fn
+        + f'\nlink_one "{target.as_posix()}" "{occupied.as_posix()}" && echo LINKED || echo REFUSED\n'
+    )
+    result = subprocess.run([bash, "-c", script], capture_output=True, text=True, timeout=30)
+
+    assert result.stdout.strip().endswith("REFUSED"), (
+        f"link_one overwrote an existing file instead of refusing: {result.stdout!r}"
+    )
+    assert occupied.read_text(encoding="utf-8") == "belongs to another tool", (
+        "the pre-existing file was modified"
+    )
+
+
+def test_the_symlink_is_created_when_the_name_is_free(source, tmp_path):
+    """The refusal above must not be the function simply never working."""
+    bash = _find_bash()
+    if not bash:
+        pytest.skip("bash unavailable")
+
+    fn = _extract_shell_function(source, "link_one")
+    target = tmp_path / "console_script"
+    target.write_text("#!/bin/sh\n", encoding="utf-8")
+    fresh = tmp_path / "fresh_name"
+
+    script = (
+        "ok() { :; }\nwarn() { :; }\n"
+        + fn
+        + f'\nlink_one "{target.as_posix()}" "{fresh.as_posix()}" && echo LINKED || echo REFUSED\n'
+    )
+    result = subprocess.run([bash, "-c", script], capture_output=True, text=True, timeout=30)
+
+    if not fresh.exists():
+        pytest.skip("this filesystem cannot create the link (Git Bash without symlink support)")
+    assert result.stdout.strip().endswith("LINKED")
 
 
 def test_the_link_check_uses_inode_comparison(source):
