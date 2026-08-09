@@ -46,13 +46,13 @@ data/
 # gitignore patterns match at every depth, so it would silently exclude the
 # jarvis/tools/ package itself.
 
-# Generated launchers.
-# `/jarvis` alone would match the PACKAGE DIRECTORY as well as the launcher
-# script install.sh writes, excluding the entire source tree from the repo.
-# Re-include the directory explicitly.
+# Generated launcher (Windows only — install.ps1 writes it).
+# There is deliberately no `/jarvis` rule any more: install.sh no longer writes
+# a launcher of that name, because $ROOT/jarvis IS the package directory and the
+# redirect failed with EISDIR on Linux. `pip install -e .` provides the console
+# script instead. A `/jarvis` rule here would also have matched the package
+# directory and excluded the whole source tree.
 jarvis.bat
-/jarvis
-!/jarvis/
 
 # Testing
 .pytest_cache/

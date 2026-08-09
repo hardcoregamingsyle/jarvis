@@ -213,7 +213,7 @@ if [ "$SESSION" = "wayland" ]; then
     warn "operations instead of pretending. Global hotkeys cannot be grabbed at all."
     info "Options: log in with 'GNOME on Xorg'; or install ydotool for input"
     info "injection; or bind a Custom Shortcut in GNOME Settings -> Keyboard to"
-    info "'$ROOT/jarvis voice' so the compositor owns the hotkey."
+    info "'$VENV/bin/jarvis voice' so the compositor owns the hotkey."
 else
     step "Session type: $SESSION"
 fi
@@ -222,9 +222,29 @@ fi
 #  Virtual environment
 # --------------------------------------------------------------------------- #
 step "Creating the virtual environment ($VENV)"
-if [ ! -d "$VENV" ]; then
-    "$PYTHON" -m venv "$VENV" || {
-        echo "venv creation failed. On Debian/Ubuntu: sudo apt-get install -y python3-venv" >&2
+
+# `--venv /abs/path` must not be pasted onto $ROOT.
+case "$VENV" in
+    /*) VENV_DIR="$VENV" ;;
+    ~*) VENV_DIR="${VENV/#\~/$HOME}" ;;
+    *)  VENV_DIR="$ROOT/$VENV" ;;
+esac
+
+# The package name that supplies ensurepip, which is versioned on Debian and
+# Ubuntu ("python3.12-venv") as often as it is generic ("python3-venv").
+venv_package_hint() {
+    local ver
+    ver="$("$PYTHON" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo 3)"
+    case "$PM" in
+        apt) printf 'sudo apt-get install -y python3-venv || sudo apt-get install -y python%s-venv' "$ver" ;;
+        dnf) printf 'sudo dnf install -y python3-libs' ;;
+        *)   printf 'install your distribution'\''s python venv/ensurepip package' ;;
+    esac
+}
+
+if [ ! -d "$VENV_DIR" ]; then
+    "$PYTHON" -m venv "$VENV_DIR" || {
+        echo "venv creation failed. Try: $(venv_package_hint)" >&2
         exit 1
     }
     ok "created"
@@ -232,8 +252,36 @@ else
     ok "already present, reusing it"
 fi
 
-VPY="$ROOT/$VENV/bin/python"
+VPY="$VENV_DIR/bin/python"
 [ -x "$VPY" ] || { echo "Interpreter missing at $VPY" >&2; exit 1; }
+
+# A venv WITHOUT pip is the single most common Linux failure here, and the
+# error it produces on its own — "No module named pip" — sends people off to
+# install pip3, which is a different thing entirely and does not help.
+#
+# On Debian and Ubuntu, `python3 -m venv` is split across packages: without
+# python3-venv there is no ensurepip, and CPython creates bin/python and
+# pyvenv.cfg *before* it tries to install pip. So the tree exists, `[ -d ]` and
+# `[ -x ]` both pass, and on any re-run the broken venv is cheerfully reused.
+# Detect it here and say the useful thing.
+if ! "$VPY" -m pip --version >/dev/null 2>&1; then
+    printf "\n${YELLOW}The virtual environment has no pip.${RESET}\n" >&2
+    cat >&2 <<EOF
+
+  $VENV_DIR was created without pip. This is not the same problem as a
+  missing pip3: a system pip3 cannot supply one to a new virtual environment.
+  Debian and Ubuntu ship the 'ensurepip' module in a separate package.
+
+  Fix it with:
+
+      $(venv_package_hint)
+      rm -r "$VENV_DIR"
+      ./install.sh
+
+EOF
+    exit 1
+fi
+ok "pip is present"
 
 step "Upgrading pip"
 "$VPY" -m pip install --upgrade pip setuptools wheel --quiet
@@ -257,7 +305,7 @@ STATUS=$?
 set -e
 if [ $STATUS -ne 0 ]; then
     warn "Some packages failed. JARVIS will still run in degraded mode."
-    warn "Run './jarvis doctor' to see exactly what is missing."
+    warn "Run '\$JARVIS_BIN doctor' to see exactly what is missing."
 fi
 
 # --------------------------------------------------------------------------- #
@@ -314,14 +362,26 @@ fi
 # --------------------------------------------------------------------------- #
 #  Launcher
 # --------------------------------------------------------------------------- #
-step "Writing the launcher script"
-cat > "$ROOT/jarvis" <<EOF
-#!/usr/bin/env bash
-# Launch JARVIS using this project's virtual environment.
-exec "$ROOT/$VENV/bin/python" -m jarvis "\$@"
-EOF
-chmod +x "$ROOT/jarvis"
-ok "created: $ROOT/jarvis"
+step "Locating the launcher"
+
+# NO hand-written launcher here, and the reason matters.
+#
+# This used to redirect into "$ROOT/jarvis" — which on Linux names the
+# package DIRECTORY, so the redirect hit EISDIR ("Is a directory") and, under
+# `set -euo pipefail`, aborted the installer after every package had already
+# been downloaded. Windows never saw it: install.ps1 writes "jarvis.bat".
+#
+# It was also unnecessary. pyproject.toml declares
+# [project.scripts] jarvis = "jarvis.cli:main", so `pip install -e .` above has
+# already produced a console script in the venv.
+JARVIS_BIN="$VENV_DIR/bin/jarvis"
+if [ -x "$JARVIS_BIN" ]; then
+    ok "$JARVIS_BIN"
+else
+    warn "console script not found at $JARVIS_BIN"
+    info "Use '$VPY -m jarvis' instead; both entry points are equivalent."
+    JARVIS_BIN="$VPY -m jarvis"
+fi
 
 # --------------------------------------------------------------------------- #
 #  Model selection
@@ -433,10 +493,13 @@ printf "\n${GREEN}==> Installed.${RESET}\n"
 cat <<EOF
 
 ${DIM}  Try it:
-      ./jarvis doctor        check what is installed
-      ./jarvis say           audition the British voice
-      ./jarvis chat          talk to it by keyboard
-      ./jarvis voice         hands-free
+      $JARVIS_BIN doctor        check what is installed
+      $JARVIS_BIN say           audition the British voice
+      $JARVIS_BIN chat          talk to it by keyboard
+      $JARVIS_BIN voice         hands-free
+
+  Or activate the environment once and just type 'jarvis':
+      source $VENV_DIR/bin/activate
 
   A local language model is required for conversation. The quickest route:
       curl -fsSL https://ollama.com/install.sh | sh
