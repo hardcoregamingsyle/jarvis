@@ -572,7 +572,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
             _out("  https or localhost, and the tunnel makes this localhost on the client.")
         _out("  docs/REMOTE_ACCESS.md")
 
-    _out("\n  Ctrl+C to stop.\n")
+    # The subsystems are built inside serve(), after this banner: on a CPU-only
+    # box that is tens of seconds during which the port refuses connections.
+    # Saying so here is the difference between "still loading" and "broken".
+    _out("\n  Starting the subsystems; the port refuses connections until that finishes.")
+    _out("  Ctrl+C to stop.\n")
 
     try:
         serve_forever(cfg, host=host, port=port, token=token,
@@ -713,4 +717,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         reason = ""
         try:
             cfg = load_config(getattr(args, "config", None))
-       
+            from .speech.audio_io import AudioRecorder
+
+            if not AudioRecorder(cfg.stt).is_available():
+                reason = "no usable microphone was found"
+        except Exception as exc:  # noqa: BLE001
+            reason = f"the audio stack could not be initialised ({exc})"
+
+        if reason:
+            # Say why. Dropping silently into text mode looks like the voice
+            # assistant simply ignoring the fact that it is a voice assistant.
+            args.command = "chat"
+            args.func = cmd_chat
+            _out(f"Starting in text mode: {reason}.")
+            _out("Run 'jarvis doctor' to diagnose audio, or 'jarvis voice' to force voice mode.\n")
+
+    try:
+        return int(args.func(args) or 0)
+    except KeyboardInterrupt:
+        _out("\nInterrupted.")
+        return 130
+    except Exception as exc:  # noqa: BLE001
+        log.exception("command failed")
+        _out(f"\nError: {exc}")
+        _out("Run 'jarvis doctor' for a diagnosis, or -v for a full traceback.")
+        return 1
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(main())
