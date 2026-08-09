@@ -1,0 +1,50 @@
+# Line endings.
+#
+# This repository is developed on Windows and deployed on Linux, which is
+# exactly the situation that produces a shell script Linux refuses to run.
+# A CRLF in a shebang makes the kernel look for an interpreter literally named
+# "bash\r", and the resulting error — "bad interpreter: No such file or
+# directory" — names a file that plainly exists, so it reads as nonsense.
+#
+# Normalise to LF in the repository, and force LF on checkout for everything
+# Linux executes or parses, whatever the local core.autocrlf happens to be.
+* text=auto eol=lf
+
+*.sh    text eol=lf
+*.bash  text eol=lf
+*.service text eol=lf
+*.desktop  text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.py    text eol=lf
+*.toml  text eol=lf
+*.md    text eol=lf
+*.cfg   text eol=lf
+*.txt   text eol=lf
+
+# PowerShell is Windows-side; CRLF is the native convention there and the
+# Windows PowerShell 5.1 parser is happiest with it.
+*.ps1   text eol=crlf
+*.psm1  text eol=crlf
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# Binary — never touch these.
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.onnx  binary
+*.gguf  binary
+*.safetensors binary
+*.db    binary
+*.wav   binary
+*.mp3   binary
+
+# NOTE: the executable bit is NOT expressible here — it lives in the index as
+# the file mode (100755 vs 100644) and Windows checkouts cannot represent it.
+# If a new shell script is added from Windows, set it explicitly:
+#
+#     git update-index --chmod=+x path/to/script.sh
+#
+# tests/test_repo_hygiene.py fails the build if an executable script is
+# committed without it.
