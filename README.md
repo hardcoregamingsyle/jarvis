@@ -83,16 +83,36 @@ cd jarvis
 ./install.sh
 ```
 
+**That one command installs everything, including the model.** Not just the
+Python package: the inference runtime (Ollama), the model weights, the British
+voice and the speech-to-text model. Nothing is left as a printed instruction to
+run afterwards. Budget about **20 GB of disk** and an hour on a slow line.
+
+**Running it again updates all of it** — `git pull`, `pip install --upgrade`, a
+newer Ollama if one has been released, and the model weights re-checked against
+the registry. It ends with a summary saying, per component, what moved and what
+was already current.
+
+Re-checking the weights is cheap: Ollama compares digests and transfers only the
+layers that changed, so a model that is already current costs a manifest fetch
+and nothing more. `--no-update` checks presence only and changes nothing. See
+[docs/UPDATING.md](docs/UPDATING.md) for what each component does on a re-run.
+
 | flag | meaning |
 |---|---|
-| `--lean` | **default.** Voice, memory, machine control |
-| `--min` | the package only |
+| `--update` | **default.** Pull, upgrade packages, refresh the runtime |
+| `--no-update` | repair only: install what is missing, change no versions |
+| `--lean` | **default profile.** Voice, memory, machine control |
+| `--min` | the Python package only — no runtime, no weights |
 | `--full` | adds torch + transformers + AirLLM |
-| `--no-voice` | skip fetching the Piper voice |
+| `--no-voice` | skip the speech-model downloads |
+| `--no-model` | skip the Ollama and model-weight stages |
+| `--only-main-model` | do not also fetch the small interactive model |
+| `--model ID` | use `ID` — a Hugging Face repo id or an Ollama tag — as the main model |
 | `--venv PATH` | put the virtualenv somewhere else |
-| `--service` | install and enable the systemd **user** service |
+| `--service` | install and enable the systemd **user** services |
 | `--vllm` | set up the vLLM path (Linux only; see below) |
-| `--model ID` | write `ID` into `config.yaml` as the model to use |
+| `--no-link` | do not symlink `~/.local/bin/jarvis` |
 
 It reads `/etc/os-release`, detects `apt`/`dnf`/`pacman`/`zypper`, probes for
 `ffmpeg`, `espeak-ng`, `wmctrl`, `xdotool`, `notify-send`, `pactl`, `aplay`,
@@ -102,9 +122,34 @@ Wayland session and warns before you find out the hard way.
 
 **The installer never calls `sudo`.** Installing system packages is the one step
 that touches the machine outside your home directory, so it stays yours to run.
-`--model ID` edits `config.yaml` in place (creating it from
-`config.example.yaml` first), putting an Ollama-style `name:tag` into
-`llm.ollama_model` and anything else into `llm.model`.
+Ollama is installed rootless too: the official `curl … | sh` needs root, so
+JARVIS fetches the official release tarball from GitHub, unpacks it under
+`~/.local/share/jarvis/ollama`, links `~/.local/bin/ollama`, and runs it as a
+systemd **user** service.
+
+Every large download reports its size and the free space on the target disk
+*before* it starts, refuses rather than dying at 90%, resumes if interrupted,
+and is skipped when it is already current.
+
+Outside the checkout it writes only `~/.local/bin` symlinks,
+`~/.local/share/jarvis`, `~/.ollama`, the Hugging Face cache, and — with
+`--service` — `~/.config/systemd/user`. Nothing else, and never over a file it
+did not create.
+
+After it finishes, **`jarvis` works from anywhere**: the installer symlinks
+`~/.local/bin/jarvis` and, because Linux filenames are case-sensitive,
+`~/.local/bin/JARVIS` as well.
+
+```bash
+jarvis doctor
+```
+
+> Full detail — every stage with its disk cost, the complete list of paths
+> written, the per-distro system packages, the rootless Ollama mechanics,
+> air-gapped installation and uninstall — is in
+> **[docs/INSTALL.md](docs/INSTALL.md)**.
+> What a re-run actually updates, and how to roll back, is in
+> **[docs/UPDATING.md](docs/UPDATING.md)**.
 
 ### System packages
 
@@ -147,11 +192,20 @@ sudo zypper install -y portaudio-devel ffmpeg espeak-ng \
 ### Run it as a systemd **user** service
 
 ```bash
-./install.sh --service          # writes the unit, reloads systemd, enables it
-systemctl --user start jarvis.service
-systemctl --user status jarvis.service
+./install.sh --service          # writes both units, reloads systemd, enables them
+systemctl --user status jarvis-ollama.service   # the model server
+systemctl --user status jarvis.service          # the assistant
 journalctl --user -u jarvis.service -f
 ```
+
+`--service` installs two user units: `jarvis-ollama.service` first, because
+JARVIS is useless without something to think with, then `jarvis.service` — the
+prefix keeps it clear of the `ollama.service` the official root installer
+writes. The Ollama unit
+sets `OLLAMA_NUM_PARALLEL` (from `llm.max_concurrent_requests`),
+`OLLAMA_MAX_LOADED_MODELS` and `OLLAMA_KEEP_ALIVE=30m` — concurrency matters
+because JARVIS runs a tree of subagents, and keep-alive matters because
+re-reading 16 GB of weights between utterances is a minute of silence.
 
 Equivalently, from Python:
 
@@ -896,6 +950,8 @@ docs/           architecture, operations, models, tool authoring, testing, troub
 
 | | |
 |---|---|
+| [docs/INSTALL.md](docs/INSTALL.md) | The complete installation reference: every stage and its disk cost, every flag, every path written, rootless Ollama, air-gapped installs, uninstall |
+| [docs/UPDATING.md](docs/UPDATING.md) | What re-running the installer updates, what it deliberately leaves alone, and how to roll back |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How the pieces fit: the agent loop, the task tree, the event bus |
 | [docs/MODELS.md](docs/MODELS.md) | Qwen3 family, dense vs MoE, quantisation, context vs RAM, adding a model |
 | [docs/TOOL_AUTHORING.md](docs/TOOL_AUTHORING.md) | The specification for writing a tool — for humans and for JARVIS itself |

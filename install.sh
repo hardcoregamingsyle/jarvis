@@ -1,22 +1,53 @@
 #!/usr/bin/env bash
 #
-# JARVIS installer for Linux (and, with fewer features, macOS).
+# JARVIS installer AND updater for Linux (and, with fewer features, macOS).
 #
-#   ./install.sh [--lean]        default: voice, memory, machine control
-#   ./install.sh --full          adds torch + transformers + AirLLM (many GB)
-#   ./install.sh --min           the package only
-#   ./install.sh --no-voice      skip the voice-model download
-#   ./install.sh --venv PATH     use a different virtualenv directory
-#   ./install.sh --service       install + enable the systemd *user* service
-#   ./install.sh --vllm          set up the vLLM path (Linux-only, separate install)
-#   ./install.sh --model ID      write ID into config.yaml as the model to use
-#   ./install.sh --no-link       do not symlink ~/.local/bin/jarvis
+# One command installs everything JARVIS needs in order to actually answer you:
+# the Python package, the inference runtime (Ollama), the language model
+# weights, and the speech models for talking and listening.  Running it a
+# second time updates all of the same things and prints a per-component
+# summary saying what moved, what was already current, and what was skipped.
 #
-# Nothing here deletes, moves or overwrites anything, and nothing is run with
-# sudo — where a system package is needed the exact command is printed for you
-# to run yourself.  The only thing written outside this directory is a single
-# symlink at ~/.local/bin/jarvis so that `jarvis` works as a bare command; it
-# is never created over the top of an existing file.  Pass --no-link to skip it.
+#   ./install.sh                     install or update everything (the default)
+#   ./install.sh --update            the same thing, said out loud
+#   ./install.sh --no-update         repair only: no git pull, no version bumps
+#   ./install.sh --lean              default profile: voice, memory, machine control
+#   ./install.sh --full              adds torch + transformers + AirLLM (many GB)
+#   ./install.sh --min               the Python package only: no runtime, no weights
+#   ./install.sh --no-voice          skip the speech model downloads
+#   ./install.sh --no-model          skip Ollama and every model download
+#   ./install.sh --only-main-model   do not also fetch the small interactive model
+#   ./install.sh --model ID          use ID (HF repo id or Ollama tag) as the main model
+#   ./install.sh --venv PATH         use a different virtualenv directory
+#   ./install.sh --service           install + enable the systemd *user* services
+#   ./install.sh --vllm              set up the vLLM path (Linux-only, separate install)
+#   ./install.sh --no-link           do not symlink ~/.local/bin/jarvis
+#   ./install.sh --help              print this text
+#
+# Nothing here is run with sudo.  Where a system package is needed the exact
+# command is printed for you to run yourself, and Ollama is installed from its
+# official release tarball into your home directory rather than through the
+# curl|sh installer, which requires root and writes a system-wide service.
+#
+# Nothing is deleted, and no file this installer did not create is overwritten.
+# Outside this directory it writes only:
+#
+#     ~/.local/bin/jarvis        symlink to the console script (--no-link to skip)
+#     ~/.local/bin/JARVIS        the same link under the capitalised name
+#     ~/.local/bin/ollama        symlink to the Ollama binary below
+#     ~/.local/share/jarvis      voice and transcription models, and the Ollama
+#                                runtime itself in ~/.local/share/jarvis/ollama
+#     ~/.ollama                  the model weight cache
+#     ~/.config/systemd/user     user service units (--service only)
+#
+# Each of those is created only if absent, or replaced only when this installer
+# is the thing that created it.  config.yaml in this directory is edited in
+# place: the llm keys below are rewritten and every other setting, comment and
+# blank line is preserved byte for byte.
+#
+# Every large download reports its size and the free space on the target disk
+# BEFORE it starts, refuses to start when it would not fit, resumes if it was
+# interrupted, and is skipped entirely when it is already current.
 #
 set -euo pipefail
 
@@ -29,7 +60,26 @@ VENV=".venv"
 WANT_SERVICE=0
 WANT_VLLM=0
 WANT_LINK=1
+WANT_UPDATE=1
+WANT_MODEL=1
+WANT_FAST_MODEL=1
 MODEL_ID=""
+
+# The small model exists so that voice is usable on the first evening. The main
+# model is dense and thinks before it answers; at roughly 1 tok/s on a CPU-only
+# laptop that is a research assistant, not a conversation.
+FAST_TAG="qwen3:4b-instruct-2507-q4_K_M"
+FALLBACK_MAIN_TAG="qwen3.6:27b"
+
+# Print the comment block at the top of this file. Deriving the help from the
+# header means the two can never drift apart, which a hard-coded line range did.
+usage() {
+    awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
+}
+
+# Saved before the parse loop consumes them: if `git pull` brings in a new
+# version of this script we re-exec it with the arguments we were given.
+ORIGINAL_ARGS=("$@")
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -40,6 +90,10 @@ while [ $# -gt 0 ]; do
         --service) WANT_SERVICE=1 ;;
         --vllm) WANT_VLLM=1 ;;
         --no-link) WANT_LINK=0 ;;
+        --update) WANT_UPDATE=1 ;;
+        --no-update) WANT_UPDATE=0 ;;
+        --no-model) WANT_MODEL=0 ;;
+        --only-main-model) WANT_FAST_MODEL=0 ;;
         --model)
             if [ $# -lt 2 ]; then echo "--model requires a model id" >&2; exit 1; fi
             MODEL_ID="$2"; shift
@@ -48,7 +102,7 @@ while [ $# -gt 0 ]; do
             if [ $# -lt 2 ]; then echo "--venv requires a path" >&2; exit 1; fi
             VENV="$2"; shift
             ;;
-        -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+        -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
     shift
@@ -62,12 +116,495 @@ info() { printf "    %s\n" "$1"; }
 
 OS="$(uname -s 2>/dev/null || echo unknown)"
 
+# --------------------------------------------------------------------------- #
+#  The summary
+#
+#  The question this installer has to answer out loud is "did re-running it
+#  update everything?".  Every section therefore records one line, and the run
+#  ends by printing them together: updated / installed / already current /
+#  skipped (why) / failed (why).  Nothing else in the output is a substitute:
+#  a wall of pip and download chatter does not tell you what state you are in.
+# --------------------------------------------------------------------------- #
+SUMMARY=""
+SUMMARY_PRINTED=0
+
+record() {
+    # component | state | detail   (details must not contain a pipe)
+    SUMMARY="${SUMMARY}${1}|${2}|${3:-}
+"
+}
+
+print_summary() {
+    if [ "$SUMMARY_PRINTED" -eq 1 ] || [ -z "$SUMMARY" ]; then
+        return 0
+    fi
+    SUMMARY_PRINTED=1
+    printf "\n${CYAN}==> Summary${RESET}\n"
+    printf "%s" "$SUMMARY" | while IFS='|' read -r comp state detail; do
+        [ -n "$comp" ] || continue
+        colour="$RESET"
+        case "$state" in
+            updated|installed)  colour="$GREEN" ;;
+            "already current")  colour="$GREEN" ;;
+            skipped)            colour="$DIM" ;;
+            failed)             colour="$YELLOW" ;;
+        esac
+        printf "    %-18s %b%-16s%b %s\n" "$comp" "$colour" "$state" "$RESET" "$detail"
+    done
+}
+
+# Print it even if a later section dies, so a half-finished run still says
+# where it got to.
+trap print_summary EXIT
+
+# --------------------------------------------------------------------------- #
+#  Disk space
+#
+#  A 16 GB model that runs out of room at 90% is a wasted afternoon and a
+#  confusing error.  Everything large is therefore preceded by a check that
+#  prints the size and the free space and refuses rather than starting.
+# --------------------------------------------------------------------------- #
+
+# Free space in decimal GB (10^9), matching how model sizes are quoted.
+# Prints nothing at all when it cannot tell, which callers treat as "unknown".
+free_gb() {
+    local probe="$1" parent
+    while [ ! -d "$probe" ]; do
+        parent="$(dirname "$probe")"
+        if [ "$parent" = "$probe" ]; then break; fi
+        probe="$parent"
+    done
+    if [ ! -d "$probe" ]; then return 0; fi
+    df -Pk "$probe" 2>/dev/null | awk 'NR == 2 { printf "%d", int($4 * 1024 / 1000000000) }'
+}
+
+# Download size in GB for an Ollama tag. The figures come from
+# jarvis.llm.models.KNOWN_MODELS; this table is the fallback used when the
+# package cannot be imported yet, and errs upwards for anything unrecognised.
+model_size_gb() {
+    case "$1" in
+        *0.6b*)                       echo 1 ;;
+        *1.7b*)                       echo 2 ;;
+        *:4b*|*4b-*)                  echo 3 ;;
+        *:8b*|*8b-*)                  echo 5 ;;
+        *:14b*)                       echo 9 ;;
+        *30b-a3b*|*30b*)              echo 19 ;;
+        *27b*)                        echo 17 ;;
+        *:32b*)                       echo 20 ;;
+        *:70b*)                       echo 42 ;;
+        *235b*)                       echo 140 ;;
+        *)                            echo 20 ;;
+    esac
+}
+
+# require_disk_space DIR NEED_GB LABEL -> 0 if it fits, 1 if it does not.
+# Unknown free space is not treated as failure: refusing to install because df
+# is unavailable would be worse than trying.
+require_disk_space() {
+    local dir="$1" need="$2" label="$3" free
+    free="$(free_gb "$dir")"
+    if [ -z "$free" ]; then
+        warn "could not read free space for $dir — continuing without the check"
+        return 0
+    fi
+    info "$label: needs ~${need} GB, ${free} GB free on $dir"
+    if [ "$free" -lt "$need" ]; then
+        warn "NOT ENOUGH DISK SPACE for $label."
+        warn "Needs about ${need} GB including headroom; ${dir} has ${free} GB free."
+        return 1
+    fi
+    return 0
+}
+
+# --------------------------------------------------------------------------- #
+#  Bridge to jarvis.runtime
+#
+#  jarvis/runtime/ owns the rootless Ollama install, the model pulls and the
+#  speech assets.  This function is the only way the shell talks to it, and a
+#  checkout that predates that package degrades to printing the manual
+#  commands rather than failing.
+#
+#  Exit codes:  0 changed   1 failed   3 already current   4 skipped   5 absent
+# --------------------------------------------------------------------------- #
+RT_CHANGED=0; RT_FAILED=1; RT_CURRENT=3; RT_SKIPPED=4; RT_ABSENT=5
+
+runtime_py() {
+    JARVIS_RT_ACTION="$1" \
+    JARVIS_RT_ARG="${2:-}" \
+    JARVIS_RT_UPDATE="$WANT_UPDATE" \
+    JARVIS_RT_CONFIG="$ROOT/config.yaml" \
+        "$VPY" - <<'PYEOF'
+"""Installer -> jarvis.runtime bridge.
+
+Bound to the real jarvis.runtime API rather than guessing at it, so a rename
+on that side shows up here as a loud FAILED line naming the function instead
+of a silent wrong call.  Progress goes to stderr so that the value-returning
+actions can still be captured with command substitution.  Nothing raises:
+every failure becomes an exit code the shell turns into one summary line.
+"""
+from __future__ import annotations
+
+import os
+import sys
+
+CHANGED, FAILED, CURRENT, SKIPPED, ABSENT = 0, 1, 3, 4, 5
+
+ACTION = os.environ.get("JARVIS_RT_ACTION", "")
+ARG = os.environ.get("JARVIS_RT_ARG", "").strip()
+UPDATE = os.environ.get("JARVIS_RT_UPDATE", "0") == "1"
+CONFIG_PATH = os.environ.get("JARVIS_RT_CONFIG", "")
+
+#: Actions reported by jarvis.runtime that mean bytes actually moved.
+FETCHED = ("pulled", "fetched", "downloaded", "installed", "upgraded", "written")
+#: ...and the ones that mean it was already there.
+UNCHANGED = ("present", "current", "skipped", "already-running", "external")
+
+
+def say(text):
+    sys.stderr.write("    %s\n" % text)
+
+
+def load_cfg():
+    try:
+        from jarvis.core.config import load_config
+    except Exception as exc:
+        say("config unavailable: %s" % exc)
+        return None
+    try:
+        if CONFIG_PATH and os.path.exists(CONFIG_PATH):
+            return load_config(CONFIG_PATH)
+        return load_config()
+    except Exception as exc:
+        say("could not read config.yaml: %s" % exc)
+        return None
+
+
+def runtime():
+    try:
+        import jarvis.runtime as rt
+        return rt
+    except Exception as exc:
+        say("jarvis.runtime is not available here (%s)" % exc)
+        return None
+
+
+def verdict(result, *, changed_when_ok=True):
+    """(exit code, reason) from the {ok, action, reason} dicts jarvis.runtime returns."""
+    if not isinstance(result, dict):
+        return (CHANGED if result else FAILED), ""
+    reason = str(result.get("reason") or "")
+    if not result.get("ok"):
+        return FAILED, reason
+    action = str(result.get("action") or "")
+    if action in UNCHANGED:
+        return CURRENT, reason
+    if action in FETCHED:
+        return CHANGED, reason
+    return (CHANGED if changed_when_ok else CURRENT), reason
+
+
+# --------------------------------------------------------------------------- #
+#  Actions that print a value
+# --------------------------------------------------------------------------- #
+def action_configured_tag():
+    cfg = load_cfg()
+    tag = ""
+    if cfg is not None:
+        tag = str(getattr(getattr(cfg, "llm", None), "ollama_model", "") or "")
+    sys.stdout.write(tag.strip() + "\n")
+    return CHANGED if tag.strip() else FAILED
+
+
+def action_resolve_tag():
+    """Map a Hugging Face repo id onto the Ollama tag that serves it."""
+    if ":" in ARG:
+        sys.stdout.write(ARG + "\n")
+        return CHANGED
+    try:
+        from jarvis.llm import models
+        spec = models.resolve(ARG)
+    except Exception as exc:
+        say("no Ollama tag known for %s (%s)" % (ARG, exc))
+        return FAILED
+    tag = str(getattr(spec, "ollama_tag", "") or "")
+    sys.stdout.write(tag + "\n")
+    return CHANGED if tag else FAILED
+
+
+def action_model_size():
+    """Download size in whole GB, rounded up, for the disk-space check."""
+    try:
+        from jarvis.llm import models
+        figures = models.estimate_footprint(ARG)
+        size = float(figures.get("download_gb") or 0.0)
+    except Exception:
+        return FAILED
+    if size <= 0:
+        return FAILED
+    sys.stdout.write("%d\n" % int(size + 0.999))
+    return CHANGED
+
+
+# --------------------------------------------------------------------------- #
+#  Actions that change the machine
+# --------------------------------------------------------------------------- #
+def action_ollama():
+    rt = runtime()
+    if rt is None:
+        return ABSENT
+    cfg = load_cfg()
+    try:
+        plan = rt.ollama.install_plan(cfg)
+    except Exception as exc:
+        say("install_plan failed: %s" % exc)
+        plan = {}
+    if plan:
+        say("plan: %s" % (plan.get("action") or "?"))
+        if plan.get("url"):
+            say("from: %s" % plan["url"])
+            say("size: %s GB -> %s" % (plan.get("size_gb"), plan.get("target_dir")))
+        if plan.get("reason"):
+            say(plan["reason"])
+        # --no-update promises no version bumps, and that has to include this one.
+        if plan.get("action") == "upgrade" and not UPDATE:
+            say("a newer ollama exists; left alone because --no-update was given")
+            return CURRENT
+    try:
+        result = rt.ollama.install(cfg)
+    except Exception as exc:
+        say("ollama.install failed: %s" % exc)
+        return FAILED
+    code, reason = verdict(result, changed_when_ok=bool(result.get("installed_now")))
+    if reason:
+        say(reason)
+    return code
+
+
+def action_serve():
+    """A pull needs a server; ensure_model reports 'no-server' without one."""
+    rt = runtime()
+    if rt is None:
+        return ABSENT
+    cfg = load_cfg()
+    try:
+        result = rt.ollama.start_server(cfg)
+    except Exception as exc:
+        say("start_server failed: %s" % exc)
+        return FAILED
+    code, reason = verdict(result)
+    if reason:
+        say(reason)
+    return code
+
+
+def action_model():
+    if not ARG:
+        return SKIPPED
+    rt = runtime()
+    if rt is None:
+        return ABSENT
+    cfg = load_cfg()
+    try:
+        # On an update run, re-check the tag against the registry rather than
+        # merely confirming that some copy of it exists.  An Ollama tag is a
+        # moving target -- qwen3.6:27b is re-pointed upstream when the model is
+        # re-quantised -- so "present" and "current" are different claims.
+        # Ollama compares digests and transfers only changed layers, so this is
+        # a manifest fetch when the model is already up to date.
+        result = rt.ollama.ensure_model(cfg, tag=ARG, refresh=UPDATE)
+    except Exception as exc:
+        say("ensure_model failed: %s" % exc)
+        return FAILED
+    code, reason = verdict(result)
+    if reason:
+        say(reason)
+    return code
+
+
+def action_assets():
+    """Voice and transcription only — the runtime and weights are pulled above."""
+    rt = runtime()
+    if rt is None:
+        return ABSENT
+    cfg = load_cfg()
+    try:
+        result = rt.assets.provision_all(cfg, skip=["ollama", "model"])
+    except Exception as exc:
+        say("provision_all failed: %s" % exc)
+        return FAILED
+    for line in result.get("summary") or []:
+        if not line.startswith("[ok] ollama") and not line.startswith("[ok] model"):
+            say(line)
+    components = result.get("components") or {}
+    interesting = [components.get(name) or {} for name in ("voice", "stt")]
+    if not result.get("ok"):
+        return FAILED
+    if any(str(entry.get("action") or "") in FETCHED for entry in interesting):
+        return CHANGED
+    return CURRENT
+
+
+def action_ollama_service():
+    """Write and enable the Ollama systemd user unit (jarvis.runtime names it)."""
+    rt = runtime()
+    if rt is None:
+        return ABSENT
+    cfg = load_cfg()
+    try:
+        result = rt.ollama.install_service(cfg)
+    except Exception as exc:
+        say("install_service failed: %s" % exc)
+        return FAILED
+    if not result.get("ok"):
+        say(str(result.get("reason") or "the unit could not be written"))
+        return FAILED
+    say(str(result.get("reason") or ""))
+    say("path: %s" % result.get("path"))
+    # ok=True only means the unit file is on disk.  install_service reports a
+    # failed `systemctl --user enable --now` in "enabled", and a summary line
+    # saying "enabled" when it is not is exactly the kind of optimistic
+    # constant this installer is supposed to have stopped printing.
+    if not result.get("enabled"):
+        return FAILED
+    return CHANGED if result.get("written") else CURRENT
+
+
+def action_status():
+    rt = runtime()
+    if rt is None:
+        return ABSENT
+    try:
+        result = rt.status(load_cfg())
+    except Exception as exc:
+        say("status unavailable: %s" % exc)
+        return FAILED
+    say("ready: %s" % ("yes" if result.get("ready") else "no"))
+    missing = result.get("missing") or []
+    if missing:
+        say("missing: %s" % ", ".join(str(item) for item in missing))
+    runtime_info = result.get("ollama") or {}
+    if isinstance(runtime_info, dict):
+        say("ollama  installed=%s serving=%s model=%s present=%s" % (
+            bool(runtime_info.get("installed")),
+            bool(runtime_info.get("serving")),
+            runtime_info.get("model"),
+            bool(runtime_info.get("model_present")),
+        ))
+    for name in ("voice", "stt"):
+        entry = result.get(name) or {}
+        if isinstance(entry, dict):
+            say("%-7s %s" % (name, entry.get("reason") or entry.get("summary") or ""))
+    return CHANGED if result.get("ready") else CURRENT
+
+
+ACTIONS = {
+    "configured-tag": action_configured_tag,
+    "resolve-tag": action_resolve_tag,
+    "model-size": action_model_size,
+    "ollama": action_ollama,
+    "serve": action_serve,
+    "model": action_model,
+    "assets": action_assets,
+    "ollama-service": action_ollama_service,
+    "status": action_status,
+}
+
+handler = ACTIONS.get(ACTION)
+if handler is None:
+    say("unknown runtime action: %s" % ACTION)
+    raise SystemExit(FAILED)
+try:
+    raise SystemExit(handler())
+except SystemExit:
+    raise
+except Exception as exc:            # never let the bridge take the installer down
+    say("%s: %s" % (ACTION, exc))
+    raise SystemExit(FAILED)
+PYEOF
+}
+
+# runtime_py, but for the actions that print a value; empty on any failure.
+runtime_capture() {
+    local out
+    set +e
+    out="$(runtime_py "$1" "${2:-}" 2>/dev/null)"
+    set -e
+    printf "%s" "$out" | tr -d '\r\n'
+}
+
 cat <<'BANNER'
     ___  _   _____   _   _ ___ ___
    |_ _|/_\ | _ \ \ / /_| / __/ __|
     | |/ _ \|   /\ V / | \__ \__ \
    |___/_/ \_\_|_\ \_/  |_|___/___/   installer for Linux
 BANNER
+
+# --------------------------------------------------------------------------- #
+#  The checkout itself
+#
+#  This runs first so the rest of the install is the code you just fetched.
+#  It is deliberately timid: a working tree with local edits, a detached HEAD
+#  or a branch with no upstream is reported and left completely alone.  This
+#  installer never throws away work you have not committed.
+# --------------------------------------------------------------------------- #
+step "Updating the checkout"
+
+PULLED_RANGE="${JARVIS_INSTALL_PULLED:-}"
+if [ -n "$PULLED_RANGE" ]; then
+    ok "already pulled this run: $PULLED_RANGE"
+    record "Repository" "updated" "$PULLED_RANGE"
+elif [ "$WANT_UPDATE" -eq 0 ]; then
+    info "skipped (--no-update)"
+    record "Repository" "skipped" "--no-update"
+elif ! command -v git >/dev/null 2>&1; then
+    info "git is not installed — nothing to pull"
+    record "Repository" "skipped" "git not installed"
+elif ! git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    info "not a git checkout — update it however you obtained it"
+    record "Repository" "skipped" "not a git checkout"
+elif [ -n "$(git -C "$ROOT" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+    # Tracked files have been edited. Untracked ones are deliberately ignored:
+    # a stray note in the directory is no reason to refuse an update, and git
+    # itself refuses a fast-forward that would overwrite one.
+    warn "tracked files have local changes, so nothing was pulled."
+    warn "Commit them, or set them aside yourself, and re-run — 'git status'"
+    warn "lists them. The installer will not discard your work to update."
+    record "Repository" "skipped" "local changes present"
+elif ! BRANCH="$(git -C "$ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null)"; then
+    info "detached HEAD — check out a branch to be able to update"
+    record "Repository" "skipped" "detached HEAD"
+elif ! git -C "$ROOT" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' >/dev/null 2>&1; then
+    info "branch '$BRANCH' tracks nothing upstream"
+    record "Repository" "skipped" "no upstream for $BRANCH"
+else
+    BEFORE_SHA="$(git -C "$ROOT" rev-parse HEAD)"
+    set +e
+    git -C "$ROOT" pull --ff-only
+    PULL_STATUS=$?
+    set -e
+    AFTER_SHA="$(git -C "$ROOT" rev-parse HEAD)"
+    if [ $PULL_STATUS -ne 0 ]; then
+        warn "git pull --ff-only failed (offline, or the branch has diverged)."
+        warn "Nothing was changed. Reconcile it yourself and re-run."
+        record "Repository" "failed" "git pull --ff-only returned $PULL_STATUS"
+    elif [ "$BEFORE_SHA" = "$AFTER_SHA" ]; then
+        ok "already up to date ($BRANCH)"
+        record "Repository" "already current" "$BRANCH"
+    else
+        RANGE="${BEFORE_SHA:0:8}..${AFTER_SHA:0:8}"
+        ok "updated $BRANCH  $RANGE"
+        record "Repository" "updated" "$RANGE"
+        # bash reads a script incrementally, so continuing to run an install.sh
+        # that git has just rewritten underneath us would execute a spliced
+        # mixture of both versions. Start the new one instead.
+        if [ "${JARVIS_INSTALL_REEXEC:-0}" != "1" ]; then
+            ok "the installer itself changed — restarting it"
+            export JARVIS_INSTALL_REEXEC=1
+            export JARVIS_INSTALL_PULLED="$RANGE"
+            exec "${BASH:-bash}" "$0" ${ORIGINAL_ARGS[@]+"${ORIGINAL_ARGS[@]}"}
+        fi
+    fi
+fi
 
 # --------------------------------------------------------------------------- #
 #  Distribution
@@ -198,8 +735,10 @@ if [ -n "${NEEDS// /}" ]; then
     info "  pactl      audio device listing and switching"
     info "  python3-venv  the virtual environment this installer creates"
     warn "JARVIS installs regardless; the affected features degrade, they do not crash."
+    record "System libs" "skipped" "missing:$NEEDS (printed the command)"
 else
     ok "all present"
+    record "System libs" "already current" "all present"
 fi
 
 # --------------------------------------------------------------------------- #
@@ -280,7 +819,7 @@ if ! "$VPY" -m pip --version >/dev/null 2>&1; then
   Fix it with:
 
       $(venv_package_hint)
-      rm -r "$VENV_DIR"
+      delete the directory $VENV_DIR
       ./install.sh
 
 EOF
@@ -294,16 +833,33 @@ ok "done"
 
 # --------------------------------------------------------------------------- #
 #  Dependencies
+#
+#  --upgrade is the whole difference between "installed" and "updated": a plain
+#  `pip install -r requirements.txt` is satisfied by whatever is already there
+#  and silently leaves every pinned dependency at the version it found. That is
+#  why re-running the old installer never moved anything.
 # --------------------------------------------------------------------------- #
+PIP_ARGS=(--disable-pip-version-check)
+if [ "$WANT_UPDATE" -eq 1 ]; then
+    PIP_ARGS+=(--upgrade)
+fi
+
 step "Installing the '$PROFILE' profile"
+info "pip arguments: ${PIP_ARGS[*]}"
 set +e
 case "$PROFILE" in
-    min)  "$VPY" -m pip install -e . ;;
-    lean) "$VPY" -m pip install -e . && "$VPY" -m pip install -r requirements.txt ;;
+    min)
+        "$VPY" -m pip install "${PIP_ARGS[@]}" -e .
+        ;;
+    lean)
+        "$VPY" -m pip install "${PIP_ARGS[@]}" -e . \
+            && "$VPY" -m pip install "${PIP_ARGS[@]}" -r requirements.txt
+        ;;
     full)
-        "$VPY" -m pip install -e .
+        "$VPY" -m pip install "${PIP_ARGS[@]}" -e .
         warn "This downloads torch and friends — several gigabytes."
-        "$VPY" -m pip install -r requirements-full.txt
+        require_disk_space "$ROOT" 12 "the full profile (torch and friends)" \
+            && "$VPY" -m pip install "${PIP_ARGS[@]}" -r requirements-full.txt
         ;;
 esac
 STATUS=$?
@@ -311,7 +867,357 @@ set -e
 if [ $STATUS -ne 0 ]; then
     warn "Some packages failed. JARVIS will still run in degraded mode."
     warn "Run '\$JARVIS_BIN doctor' to see exactly what is missing."
+    record "Python packages" "failed" "$PROFILE profile — see the output above"
+elif [ "$WANT_UPDATE" -eq 1 ]; then
+    record "Python packages" "updated" "$PROFILE profile, --upgrade"
+else
+    record "Python packages" "installed" "$PROFILE profile, no version bumps"
 fi
+
+# --------------------------------------------------------------------------- #
+#  Model selection -> config.yaml
+#
+#  Written before anything is downloaded so that the pull below and JARVIS at
+#  runtime agree about which model this machine has.
+# --------------------------------------------------------------------------- #
+MAIN_TAG=""
+if [ "$WANT_MODEL" -eq 1 ] && [ "$PROFILE" != "min" ]; then
+    if [ -n "$MODEL_ID" ]; then
+        MAIN_TAG="$(runtime_capture resolve-tag "$MODEL_ID")"
+        [ -n "$MAIN_TAG" ] || MAIN_TAG="$MODEL_ID"
+    else
+        MAIN_TAG="$(runtime_capture configured-tag)"
+        [ -n "$MAIN_TAG" ] || MAIN_TAG="$FALLBACK_MAIN_TAG"
+    fi
+fi
+
+if [ -n "$MODEL_ID" ] || [ -n "$MAIN_TAG" ]; then
+    step "Recording the model in config.yaml"
+    if [ ! -f "$ROOT/config.yaml" ] && [ -f "$ROOT/config.example.yaml" ]; then
+        cp "$ROOT/config.example.yaml" "$ROOT/config.yaml"
+        ok "config.yaml created from config.example.yaml"
+    fi
+
+    SET_LINES="backend=ollama"
+    if [ -n "$MAIN_TAG" ]; then
+        SET_LINES="$SET_LINES
+ollama_model=$MAIN_TAG"
+    fi
+    if [ -n "$MODEL_ID" ] && [ "${MODEL_ID#*:}" = "$MODEL_ID" ]; then
+        # No colon, so it is a Hugging Face repo id rather than an Ollama tag.
+        SET_LINES="$SET_LINES
+model=$MODEL_ID"
+    fi
+
+    set +e
+    JARVIS_SET_MODEL="$SET_LINES" JARVIS_CONFIG_FILE="$ROOT/config.yaml" "$VPY" - <<'PYEOF'
+"""Set keys inside the llm: block of config.yaml without needing PyYAML.
+
+The file is edited line by line so comments, ordering and every other setting
+survive untouched; only the keys named in JARVIS_SET_MODEL are rewritten, and
+any that were not already present are appended to the end of the block.
+
+Three rules, each of which this got wrong once:
+
+* **Match the block's own indentation.**  Appending two-space keys to a block
+  written with four produced a file PyYAML refuses to parse, and load_config
+  does not catch YAMLError — so a perfectly ordinary formatting choice turned
+  every later `jarvis` command into a traceback, with no backup of the file
+  that holds the api_key.
+* **Do not overturn a deliberate choice.**  `backend` is only moved off "auto"
+  (or an empty value, or the one we would write anyway).  Somebody who set
+  `backend: vllm` — which the --vllm section of this installer tells them to
+  do — must not have it silently reset on the next run.
+* **Say whether anything actually changed**, so the summary is not a constant.
+
+Exit: 0 rewritten, 3 already correct, 1 refused.
+"""
+from __future__ import annotations
+
+import os
+import re
+from pathlib import Path
+
+CHANGED, FAILED, CURRENT = 0, 1, 3
+
+#: Values of a key that this installer is allowed to overwrite.  Anything else
+#: was chosen by the owner on purpose and is left exactly as it is.
+OVERWRITABLE = {"backend": {"", "auto", "ollama"}}
+
+path = Path(os.environ["JARVIS_CONFIG_FILE"])
+wanted = []
+for raw in os.environ.get("JARVIS_SET_MODEL", "").splitlines():
+    raw = raw.strip()
+    if not raw or "=" not in raw:
+        continue
+    key, _, value = raw.partition("=")
+    wanted.append((key.strip(), value.strip()))
+if not wanted:
+    raise SystemExit(CURRENT)
+
+by_key = dict(wanted)
+try:
+    original = path.read_text(encoding="utf-8") if path.exists() else ""
+except OSError as exc:
+    print("    could not read %s: %s" % (path, exc))
+    raise SystemExit(FAILED)
+lines = original.splitlines()
+
+out = []
+done = set()
+kept = []                    # keys deliberately left at the owner's value
+in_llm = False
+seen_llm = False
+indent = ["  "]              # the block's own indentation, learned from it
+indent_known = [False]
+
+
+def flush(target):
+    for key, value in wanted:
+        if key not in done:
+            target.append("%s%s: %s" % (indent[0], key, value))
+            done.add(key)
+
+
+for line in lines:
+    if re.match(r"^llm:\s*$", line):
+        in_llm = True
+        seen_llm = True
+        out.append(line)
+        continue
+    if in_llm and line and not line[0].isspace() and not line.startswith("#"):
+        flush(out)
+        in_llm = False
+    if in_llm:
+        match = re.match(r"^(\s+)([A-Za-z_][A-Za-z0-9_]*)\s*:(.*)$", line)
+        if match:
+            # The first key inside the block fixes the indentation for every
+            # key we append, and tells us which lines are direct children of
+            # llm: rather than of some nested mapping under it.
+            if not indent_known[0]:
+                indent[0] = match.group(1)
+                indent_known[0] = True
+            key = match.group(2)
+            if (match.group(1) == indent[0]
+                    and key in by_key and key not in done):
+                current = match.group(3).strip()
+                allowed = OVERWRITABLE.get(key)
+                if allowed is not None and current not in allowed:
+                    done.add(key)
+                    kept.append((key, current))
+                    out.append(line)
+                    continue
+                out.append("%s%s: %s" % (match.group(1), key, by_key[key]))
+                done.add(key)
+                continue
+    out.append(line)
+
+if in_llm:
+    flush(out)
+if not seen_llm:
+    out.append("llm:")
+    indent[0] = "  "
+    flush(out)
+
+updated = "\n".join(out) + "\n"
+if updated == original:
+    for key, value in wanted:
+        if key not in dict(kept):
+            print("    llm.%s: %s (already set)" % (key, value))
+    raise SystemExit(CURRENT)
+
+# Belt and braces: never replace a file that parses with one that does not.
+try:
+    import yaml  # type: ignore
+except ImportError:
+    yaml = None
+if yaml is not None:
+    try:
+        yaml.safe_load(original)
+    except Exception:
+        pass                 # it was already unparseable; we cannot make it worse
+    else:
+        try:
+            yaml.safe_load(updated)
+        except Exception as exc:
+            print("    refusing to write %s: the result would not parse (%s)"
+                  % (path, exc.__class__.__name__))
+            raise SystemExit(FAILED)
+
+try:
+    path.write_text(updated, encoding="utf-8")
+except OSError as exc:
+    print("    could not write %s: %s" % (path, exc))
+    raise SystemExit(FAILED)
+for key, value in wanted:
+    if key in dict(kept):
+        continue
+    print("    llm.%s: %s" % (key, value))
+for key, current in kept:
+    print("    llm.%s: left at '%s' — you set it deliberately" % (key, current))
+raise SystemExit(CHANGED)
+PYEOF
+    CFG_STATUS=$?
+    set -e
+    CFG_DETAIL="llm.backend=ollama${MAIN_TAG:+, llm.ollama_model=$MAIN_TAG}"
+    case "$CFG_STATUS" in
+        0) ok "config.yaml updated";        record "config.yaml" "updated" "$CFG_DETAIL" ;;
+        3) ok "config.yaml already correct"; record "config.yaml" "already current" "$CFG_DETAIL" ;;
+        *) warn "config.yaml was left alone; see the message above"
+           record "config.yaml" "failed" "could not record the model" ;;
+    esac
+fi
+
+# --------------------------------------------------------------------------- #
+#  Inference runtime and model weights
+#
+#  This is the part that used to be a printed instruction. Ollama is fetched
+#  from its official GitHub release tarball and unpacked under ~/.local, run as
+#  a systemd *user* service: no root, no /usr/local, no system unit.
+# --------------------------------------------------------------------------- #
+OLLAMA_DATA="${OLLAMA_MODELS:-$HOME/.ollama}"
+XDG_DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
+OLLAMA_RUNTIME_GB=3          # tarball plus the unpacked libraries
+SPEECH_ASSETS_GB=2           # piper voice ~60 MB, faster-whisper base.en ~150 MB
+
+if [ "$WANT_MODEL" -eq 0 ]; then
+    step "Skipping the inference runtime and all weights (--no-model)"
+    record "Ollama runtime" "skipped" "--no-model"
+    record "Main model" "skipped" "--no-model"
+    record "Fast model" "skipped" "--no-model"
+elif [ "$PROFILE" = "min" ]; then
+    step "Skipping the inference runtime and all weights (--min)"
+    record "Ollama runtime" "skipped" "--min profile"
+    record "Main model" "skipped" "--min profile"
+    record "Fast model" "skipped" "--min profile"
+else
+    # ---- what is about to happen, in numbers, before anything downloads ---- #
+    MAIN_GB="$(runtime_capture model-size "$MAIN_TAG")"
+    case "$MAIN_GB" in ''|*[!0-9]*) MAIN_GB="$(model_size_gb "$MAIN_TAG")" ;; esac
+    FAST_GB="$(runtime_capture model-size "$FAST_TAG")"
+    case "$FAST_GB" in ''|*[!0-9]*) FAST_GB="$(model_size_gb "$FAST_TAG")" ;; esac
+
+    if [ "$MAIN_TAG" = "$FAST_TAG" ]; then
+        WANT_FAST_MODEL=0
+    fi
+
+    step "Download plan"
+    info "Ollama runtime                   ~${OLLAMA_RUNTIME_GB} GB   -> $XDG_DATA/jarvis/ollama"
+    info "$MAIN_TAG   ~${MAIN_GB} GB  -> $OLLAMA_DATA"
+    info "    the capable one: dense, thinks before answering, roughly 1 tok/s"
+    info "    on a CPU-only laptop. Use it for work you will wait for."
+    if [ "$WANT_FAST_MODEL" -eq 1 ]; then
+        info "$FAST_TAG   ~${FAST_GB} GB   -> $OLLAMA_DATA"
+        info "    the interactive one: answers at conversation speed, and is what"
+        info "    makes voice usable on this hardware. --only-main-model skips it."
+    else
+        info "small interactive model: skipped"
+    fi
+    info "Downloads resume if interrupted, and existing layers are not re-fetched."
+
+    # ---- runtime ---------------------------------------------------------- #
+    step "Installing the Ollama runtime (rootless, no sudo)"
+    EXISTING_OLLAMA="$(command -v ollama 2>/dev/null || true)"
+    if [ -n "$EXISTING_OLLAMA" ]; then
+        info "found an existing ollama at $EXISTING_OLLAMA"
+    fi
+    if require_disk_space "$XDG_DATA" "$OLLAMA_RUNTIME_GB" "the Ollama runtime"; then
+        set +e
+        runtime_py ollama
+        RT_STATUS=$?
+        set -e
+    else
+        RT_STATUS=$RT_SKIPPED
+    fi
+    case "$RT_STATUS" in
+        "$RT_CHANGED") ok "Ollama installed"; record "Ollama runtime" "updated" "$XDG_DATA/ollama" ;;
+        "$RT_CURRENT") ok "Ollama already current"; record "Ollama runtime" "already current" "${EXISTING_OLLAMA:-$XDG_DATA/ollama}" ;;
+        "$RT_SKIPPED") warn "Ollama install skipped"; record "Ollama runtime" "skipped" "not enough disk, or the runtime declined" ;;
+        "$RT_ABSENT")
+            warn "jarvis.runtime is not in this checkout, so Ollama was not installed."
+            info "Install it yourself without root:"
+            info "  https://github.com/ollama/ollama/releases  ->  ollama-linux-amd64.tgz"
+            info "  mkdir -p ~/.local/share/ollama && tar -C ~/.local/share/ollama -xzf ollama-linux-amd64.tgz"
+            info "  ln -s ~/.local/share/ollama/bin/ollama ~/.local/bin/ollama"
+            record "Ollama runtime" "failed" "jarvis.runtime missing — manual steps printed"
+            ;;
+        *) warn "Ollama install failed"; record "Ollama runtime" "failed" "see the output above" ;;
+    esac
+
+    # ---- the server ------------------------------------------------------- #
+    # A pull goes through the running daemon: with nothing listening,
+    # jarvis.runtime reports "no-server" and every model below would fail with
+    # the same confusing message.
+    step "Starting the Ollama server"
+    set +e
+    runtime_py serve
+    SERVE_STATUS=$?
+    set -e
+    case "$SERVE_STATUS" in
+        "$RT_CHANGED") ok "started"; record "Ollama server" "updated" "started for the pulls" ;;
+        "$RT_CURRENT") ok "already running"; record "Ollama server" "already current" "already listening" ;;
+        "$RT_ABSENT")  record "Ollama server" "skipped" "jarvis.runtime missing" ;;
+        *)             warn "the server did not start"; record "Ollama server" "failed" "see the output above" ;;
+    esac
+
+if [ "$SERVE_STATUS" -eq "$RT_FAILED" ]; then
+    warn "No Ollama server, so no model can be pulled. Start one with"
+    warn "'ollama serve' (or ./install.sh --service) and re-run."
+    record "Main model" "skipped" "no Ollama server"
+    record "Fast model" "skipped" "no Ollama server"
+else
+
+    # ---- main model ------------------------------------------------------- #
+    step "Fetching the main model: $MAIN_TAG"
+    if require_disk_space "$OLLAMA_DATA" "$((MAIN_GB + 2))" "$MAIN_TAG"; then
+        set +e
+        runtime_py model "$MAIN_TAG"
+        MODEL_STATUS=$?
+        set -e
+    else
+        MODEL_STATUS=$RT_SKIPPED
+        warn "Skipping $MAIN_TAG. Free some space and re-run, or pass"
+        warn "--model $FAST_TAG to use the small one as your main model."
+    fi
+    case "$MODEL_STATUS" in
+        "$RT_CHANGED") ok "$MAIN_TAG is present"; record "Main model" "updated" "$MAIN_TAG (~${MAIN_GB} GB)" ;;
+        "$RT_CURRENT") ok "$MAIN_TAG already current"; record "Main model" "already current" "$MAIN_TAG" ;;
+        "$RT_SKIPPED") record "Main model" "skipped" "$MAIN_TAG needs ~$((MAIN_GB + 2)) GB" ;;
+        "$RT_ABSENT")
+            info "Pull it yourself once ollama is running:"
+            info "  ollama pull $MAIN_TAG"
+            record "Main model" "failed" "jarvis.runtime missing — command printed"
+            ;;
+        *) record "Main model" "failed" "ollama pull $MAIN_TAG did not complete" ;;
+    esac
+
+    # ---- small interactive model ------------------------------------------ #
+    if [ "$WANT_FAST_MODEL" -eq 0 ]; then
+        record "Fast model" "skipped" "--only-main-model, or it is the main model"
+    else
+        step "Fetching the small interactive model: $FAST_TAG"
+        if require_disk_space "$OLLAMA_DATA" "$((FAST_GB + 1))" "$FAST_TAG"; then
+            set +e
+            runtime_py model "$FAST_TAG"
+            FAST_STATUS=$?
+            set -e
+        else
+            FAST_STATUS=$RT_SKIPPED
+        fi
+        case "$FAST_STATUS" in
+            "$RT_CHANGED") ok "$FAST_TAG is present"; record "Fast model" "updated" "$FAST_TAG (~${FAST_GB} GB)" ;;
+            "$RT_CURRENT") ok "$FAST_TAG already current"; record "Fast model" "already current" "$FAST_TAG" ;;
+            "$RT_SKIPPED") record "Fast model" "skipped" "not enough disk for ~$((FAST_GB + 1)) GB" ;;
+            "$RT_ABSENT")
+                info "  ollama pull $FAST_TAG"
+                record "Fast model" "failed" "jarvis.runtime missing — command printed"
+                ;;
+            *) record "Fast model" "failed" "ollama pull $FAST_TAG did not complete" ;;
+        esac
+    fi
+
+fi          # end of "is there a server to pull with?"
+fi          # end of "should anything be downloaded at all?"
 
 # --------------------------------------------------------------------------- #
 #  vLLM
@@ -321,18 +1227,22 @@ if [ "$WANT_VLLM" -eq 1 ]; then
     if [ "$OS" != "Linux" ]; then
         warn "vLLM is Linux-only. On Windows, run it inside WSL2 or on another host"
         warn "and point llm.vllm_host at it."
+        record "vLLM" "skipped" "not Linux"
     elif command -v nvidia-smi >/dev/null 2>&1; then
         ok "NVIDIA GPU detected — installing the prebuilt CUDA wheel."
         set +e
-        "$VPY" -m pip install vllm
+        require_disk_space "$ROOT" 10 "the vLLM CUDA wheel" \
+            && "$VPY" -m pip install vllm "${PIP_ARGS[@]}"
         VSTATUS=$?
         set -e
         if [ $VSTATUS -eq 0 ]; then
             ok "vLLM installed."
             info "Serve a model, then set llm.backend: vllm in config.yaml:"
             info "  $VENV/bin/vllm serve Qwen/Qwen3-4B-Instruct-2507 --max-model-len 8192"
+            record "vLLM" "updated" "CUDA wheel"
         else
             warn "vLLM install failed; see the output above."
+            record "vLLM" "failed" "pip exit $VSTATUS"
         fi
     else
         warn "No NVIDIA GPU found, so the published vLLM wheels do not apply and"
@@ -345,23 +1255,46 @@ if [ "$WANT_VLLM" -eq 1 ]; then
         info "  cd vllm && VLLM_TARGET_DEVICE=cpu $VPY -m pip install -e ."
         info ""
         info "Frank advice for an i5 CPU-only laptop: vLLM's value is batching many"
-        info "concurrent requests on a GPU. On CPU it will not beat Ollama with a"
-        info "small quantised model, and it is far more work to keep running:"
-        info "  curl -fsSL https://ollama.com/install.sh | sh"
-        info "  ollama pull qwen3:4b-instruct-2507-q4_K_M"
-        info "  then set llm.backend: ollama in config.yaml"
+        info "concurrent requests on a GPU. On CPU it will not beat the Ollama setup"
+        info "this installer has already built for you, and it is far more work to"
+        info "keep running."
+        record "vLLM" "skipped" "no NVIDIA GPU; source build printed"
     fi
 fi
 
 # --------------------------------------------------------------------------- #
-#  Voice model
+#  Voice model, and the transcription model that hears you
 # --------------------------------------------------------------------------- #
 if [ "$DOWNLOAD_VOICE" -eq 1 ] && [ "$PROFILE" != "min" ]; then
-    step "Fetching the British voice model"
-    "$VPY" -m jarvis setup || warn "voice download failed; edge-tts or espeak will be used"
+    step "Fetching the speech models (voice out, transcription in)"
+    if require_disk_space "$XDG_DATA" "$SPEECH_ASSETS_GB" "the speech models"; then
+        set +e
+        runtime_py assets
+        ASSET_STATUS=$?
+        set -e
+    else
+        ASSET_STATUS=$RT_SKIPPED
+    fi
+    if [ "$ASSET_STATUS" -eq "$RT_ABSENT" ]; then
+        # Older checkout: fall back to what has always worked.
+        set +e
+        "$VPY" -m jarvis setup
+        ASSET_STATUS=$?
+        set -e
+    fi
+    case "$ASSET_STATUS" in
+        "$RT_CHANGED") ok "speech models ready"; record "Speech assets" "updated" "voice + transcription" ;;
+        "$RT_CURRENT") ok "speech models already current"; record "Speech assets" "already current" "voice + transcription" ;;
+        "$RT_SKIPPED") record "Speech assets" "skipped" "not enough disk space" ;;
+        *)
+            warn "the speech download did not finish; edge-tts or espeak will be used"
+            record "Speech assets" "failed" "see the output above"
+            ;;
+    esac
 else
-    step "Skipping the voice download"
+    step "Skipping the speech downloads"
     "$VPY" -m jarvis setup --no-download || true
+    record "Speech assets" "skipped" "--no-voice or --min"
 fi
 
 # --------------------------------------------------------------------------- #
@@ -412,9 +1345,25 @@ if [ "$WANT_LINK" -eq 1 ] && [ -x "$VENV_DIR/bin/jarvis" ]; then
     # spelled; comparing readlink output as a string breaks on a relative link.
     link_one() {
         local target="$1" link="$2"
+        LINK_ACTION="created"
         if [ -e "$link" ] && [ "$link" -ef "$target" ]; then
             ok "already linked: $link"
+            LINK_ACTION="unchanged"
             return 0
+        elif [ -L "$link" ] && [ ! -e "$link" ]; then
+            # A symlink pointing at nothing: the virtualenv it named was moved,
+            # rebuilt elsewhere, or --venv changed. `-e` is false for a broken
+            # link, so without this branch it fell through to "belongs to
+            # something else" below — which is untrue, unhelpful, and left
+            # `jarvis` permanently broken with no hint of why. Say what it is;
+            # removing a name this installer found in place is still the
+            # owner's decision, not ours.
+            warn "$link is a symlink that points at nothing:"
+            warn "    $(readlink "$link" 2>/dev/null)"
+            warn "Its target has moved or been rebuilt. Nothing here removes a"
+            warn "name it found in place, so 'jarvis' stays broken until you do:"
+            warn "    rm $link  &&  ./install.sh"
+            return 1
         elif [ -e "$link" ] || [ -L "$link" ]; then
             # Never clobber. Another tool owning this name is the user's business.
             warn "$link already exists and is not ours — leaving it untouched."
@@ -427,10 +1376,16 @@ if [ "$WANT_LINK" -eq 1 ] && [ -x "$VENV_DIR/bin/jarvis" ]; then
         return 1
     }
 
+    LINK_ACTION=""
     if link_one "$VENV_DIR/bin/jarvis" "$LINK"; then
         JARVIS_ON_PATH=1
+        case "$LINK_ACTION" in
+            unchanged) record "Launcher" "already current" "$LINK" ;;
+            *)         record "Launcher" "installed" "$LINK" ;;
+        esac
     else
         info "Run JARVIS directly instead: $VENV_DIR/bin/jarvis"
+        record "Launcher" "skipped" "$LINK belongs to something else"
     fi
 
     # Linux filenames are case-sensitive, so `JARVIS` is a different command
@@ -458,76 +1413,56 @@ if [ "$WANT_LINK" -eq 1 ] && [ -x "$VENV_DIR/bin/jarvis" ]; then
                 ;;
         esac
     fi
+else
+    record "Launcher" "skipped" "--no-link, or no console script"
 fi
 
 # --------------------------------------------------------------------------- #
-#  Model selection
-# --------------------------------------------------------------------------- #
-if [ -n "$MODEL_ID" ]; then
-    step "Recording the model in config.yaml"
-    if [ ! -f "$ROOT/config.yaml" ] && [ -f "$ROOT/config.example.yaml" ]; then
-        cp "$ROOT/config.example.yaml" "$ROOT/config.yaml"
-        ok "config.yaml created from config.example.yaml"
-    fi
-    JARVIS_SET_MODEL="$MODEL_ID" JARVIS_CONFIG_FILE="$ROOT/config.yaml" "$VPY" - <<'PYEOF'
-"""Set the model id in config.yaml without needing PyYAML.
-
-A tag containing ':' (qwen3:4b-...) is an Ollama tag and belongs in
-llm.ollama_model; anything else is a Hugging Face repo id and belongs in
-llm.model.  The file is edited line by line inside the llm: block so comments
-and every other setting survive untouched.
-"""
-import os
-import re
-from pathlib import Path
-
-path = Path(os.environ["JARVIS_CONFIG_FILE"])
-model = os.environ["JARVIS_SET_MODEL"].strip()
-key = "ollama_model" if ":" in model else "model"
-
-lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else ["llm:"]
-out, in_llm, replaced = [], False, False
-for line in lines:
-    if re.match(r"^llm:\s*$", line):
-        in_llm = True
-        out.append(line)
-        continue
-    if in_llm and line and not line[0].isspace() and not line.startswith("#"):
-        if not replaced:
-            out.append(f"  {key}: {model}")
-            replaced = True
-        in_llm = False
-    if in_llm and re.match(r"^\s+%s:\s" % key, line):
-        out.append(f"  {key}: {model}")
-        replaced = True
-        continue
-    out.append(line)
-
-if not replaced:
-    if not any(re.match(r"^llm:\s*$", ln) for ln in out):
-        out.append("llm:")
-    out.append(f"  {key}: {model}")
-
-path.write_text("\n".join(out) + "\n", encoding="utf-8")
-print("    llm.%s: %s" % (key, model))
-PYEOF
-    ok "config.yaml updated"
-fi
-
-# --------------------------------------------------------------------------- #
-#  systemd user service
+#  systemd user services
 # --------------------------------------------------------------------------- #
 if [ "$WANT_SERVICE" -eq 1 ]; then
-    step "Installing the systemd user service"
+    step "Installing the systemd user services"
     if [ "$OS" != "Linux" ]; then
         warn "systemd user services are Linux-only; skipping on $OS."
+        record "Service" "skipped" "not Linux"
     elif ! command -v systemctl >/dev/null 2>&1; then
         warn "systemctl not found — this system does not run systemd."
         info "Use the XDG autostart entry instead:"
         info "  $VPY -c 'from jarvis.linux import desktop; print(desktop.autostart_enable())'"
+        record "Service" "skipped" "no systemd"
     else
+        # Ollama first: JARVIS is useless without something to think with, and
+        # the model server has to be up before the assistant starts.
+        # jarvis.runtime writes the unit and runs `systemctl --user daemon-reload`
+        # and `enable --now` itself, so nothing is repeated here.
+        if [ "$WANT_MODEL" -eq 1 ] && [ "$PROFILE" != "min" ]; then
+            set +e
+            runtime_py ollama-service
+            OSVC_STATUS=$?
+            set -e
+            case "$OSVC_STATUS" in
+                "$RT_CHANGED")
+                    ok "the Ollama user unit was written and enabled"
+                    record "Ollama service" "updated" "unit in ~/.config/systemd/user"
+                    ;;
+                "$RT_CURRENT")
+                    ok "the Ollama user unit is already current"
+                    record "Ollama service" "already current" "unit in ~/.config/systemd/user"
+                    ;;
+                "$RT_ABSENT")
+                    record "Ollama service" "skipped" "jarvis.runtime missing"
+                    ;;
+                *)
+                    warn "the Ollama user unit was not installed or not enabled;"
+                    warn "start it by hand with: ollama serve"
+                    record "Ollama service" "failed" "see the output above"
+                    ;;
+            esac
+        fi
+
         set +e
         "$VPY" - <<'PYEOF'
+"""Exit: 0 installed and enabled, 1 not installed, 2 installed but not enabled."""
 from jarvis.linux import service
 
 result = service.install()
@@ -545,11 +1480,22 @@ if status.get("linger") is True:
     print("    lingering: already enabled")
 else:
     print("    lingering: NOT enabled")
+
+# A unit that exists but was never enabled does not start at login, and
+# reporting that as "enabled" is a lie the owner only discovers at the worst
+# possible moment.
+if not enabled.ok:
+    raise SystemExit(2)
 PYEOF
         SVC_STATUS=$?
         set -e
-        if [ $SVC_STATUS -ne 0 ]; then
+        if [ $SVC_STATUS -eq 2 ]; then
+            warn "jarvis.service was written but could not be enabled."
+            info "Enable it yourself: systemctl --user enable --now jarvis.service"
+            record "Service" "failed" "unit written, systemctl --user enable failed"
+        elif [ $SVC_STATUS -ne 0 ]; then
             warn "The service could not be installed; see the message above."
+            record "Service" "failed" "jarvis.service"
         else
             ok "installed and enabled"
             info "Start it now:   systemctl --user start jarvis.service"
@@ -559,6 +1505,7 @@ PYEOF
             warn "would stop when you log out or close the lid — silently, with no"
             warn "error anywhere. To keep it running with nobody logged in, run:"
             printf "        ${YELLOW}loginctl enable-linger %s${RESET}\n" "${USER:-$(id -un)}"
+            record "Service" "updated" "jarvis.service enabled"
         fi
     fi
 fi
@@ -566,6 +1513,13 @@ fi
 # --------------------------------------------------------------------------- #
 #  Done
 # --------------------------------------------------------------------------- #
+step "Verifying"
+set +e
+runtime_py status
+set -e
+
+print_summary
+
 # Print the invocation the user can actually type, not the one we wish worked.
 if [ "$JARVIS_ON_PATH" -eq 1 ]; then
     RUN_AS="jarvis"
@@ -578,7 +1532,36 @@ else
       source $VENV_DIR/bin/activate           # or activate the virtualenv"
 fi
 
-printf "\n${GREEN}==> Installed.${RESET}\n"
+if [ -n "$MAIN_TAG" ] && [ "$WANT_FAST_MODEL" -eq 1 ]; then
+    MODEL_NOTE="
+  Two models are installed and they are for different jobs:
+      $FAST_TAG   conversation and voice — answers immediately
+      $MAIN_TAG   hard questions — far more capable, far slower
+  config.yaml points at $MAIN_TAG. To use the quick one instead, either
+  edit llm.ollama_model in config.yaml or set it for one run:
+      JARVIS_LLM_OLLAMA_MODEL=$FAST_TAG $RUN_AS voice"
+else
+    MODEL_NOTE="
+  Model in config.yaml: ${MAIN_TAG:-none installed}"
+fi
+
+# Be exact about what a re-run does to the weights.  An update run re-checks
+# each tag against the registry; Ollama compares digests and transfers only the
+# layers that changed, so a model that is already current costs a manifest.
+if [ -n "$MAIN_TAG" ] && [ "$WANT_UPDATE" = "1" ]; then
+    WEIGHTS_NOTE="
+  Weights were re-checked against the registry, and only changed layers were
+  transferred. Run with --no-update to check presence only and change nothing."
+elif [ -n "$MAIN_TAG" ]; then
+    WEIGHTS_NOTE="
+  Weights already on disk were not re-checked this run (--no-update). To move
+  one to a newer build, ask for it by name:
+      ollama pull $MAIN_TAG"
+else
+    WEIGHTS_NOTE=""
+fi
+
+printf "\n${GREEN}==> Done.${RESET}\n"
 cat <<EOF
 
 ${DIM}  Try it:
@@ -587,11 +1570,13 @@ ${DIM}  Try it:
       $RUN_AS chat          talk to it by keyboard
       $RUN_AS voice         hands-free
 $PATH_NOTE
+$MODEL_NOTE
 
-  A local language model is required for conversation. The quickest route:
-      curl -fsSL https://ollama.com/install.sh | sh
-      ollama pull qwen3:4b-instruct-2507-q4_K_M
-  then set  llm.backend: ollama  in config.yaml.
+  Re-run this installer at any time to update everything it installed:
+      ./install.sh                 pull the repo, upgrade the Python packages,
+                                   upgrade Ollama, and fetch anything missing
+      ./install.sh --no-update     repair without changing any versions
+$WEIGHTS_NOTE
 
   Run it in the background:
       ./install.sh --service
