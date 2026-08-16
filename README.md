@@ -995,6 +995,7 @@ docs/           architecture, operations, models, tool authoring, testing, troub
 | | |
 |---|---|
 | [docs/INSTALL.md](docs/INSTALL.md) | The complete installation reference: every stage and its disk cost, every flag, every path written, rootless Ollama, air-gapped installs, uninstall |
+| [docs/SETUP_MY_LAPTOP.md](docs/SETUP_MY_LAPTOP.md) | A worked setup for a 4-core CPU-only laptop on XFCE/X11: the one `sudo` line, realistic tok/s, what to tune, and what to expect |
 | [docs/UPDATING.md](docs/UPDATING.md) | What re-running the installer updates, what it deliberately leaves alone, and how to roll back |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How the pieces fit: the agent loop, the task tree, the event bus |
 | [docs/MODELS.md](docs/MODELS.md) | Qwen3 family, dense vs MoE, quantisation, context vs RAM, adding a model |
