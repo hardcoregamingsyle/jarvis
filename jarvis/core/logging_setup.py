@@ -64,6 +64,33 @@ class ColorFormatter(logging.Formatter):
         return text
 
 
+class SafeStreamHandler(logging.StreamHandler):
+    """A console handler that tolerates its stream disappearing underneath it.
+
+    JARVIS runs real work on daemon threads — the speech queue, subagents, the
+    task pool — and those threads can still be finishing a log line after the
+    stream they write to has been closed: at interpreter shutdown, or under a
+    test runner that swaps ``sys.stderr`` for a buffer and closes it between
+    tests. The default handler responds by printing a full traceback to a
+    *different* stream, which is alarming, unactionable, and has nothing to do
+    with whatever the user was actually doing.
+
+    Losing a log line during shutdown is not an error worth reporting. Anything
+    else still goes through ``handleError`` as usual.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            stream = self.stream
+            if stream is None or getattr(stream, "closed", False):
+                return
+            super().emit(record)
+        except (ValueError, OSError):
+            # "I/O operation on closed file" and friends: the process is going
+            # away and this line goes with it.
+            return
+
+
 def setup_logging(
     level: str = "INFO",
     *,
@@ -82,7 +109,7 @@ def setup_logging(
     numeric = getattr(logging, str(level).upper(), logging.INFO)
     root.setLevel(numeric)
 
-    console = logging.StreamHandler(sys.stderr)
+    console = SafeStreamHandler(sys.stderr)
     console.setLevel(numeric)
     console.setFormatter(
         ColorFormatter(
@@ -122,4 +149,4 @@ def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(name)
 
 
-__all__ = ["setup_logging", "get_logger", "ColorFormatter"]
+__all__ = ["setup_logging", "get_logger", "ColorFormatter", "SafeStreamHandler"]

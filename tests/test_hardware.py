@@ -834,3 +834,73 @@ print("ALL GOOD")
     )
     assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
     assert "ALL GOOD" in result.stdout
+
+
+# --------------------------------------------------------------------------- #
+#  AMD cards that ROCm cannot drive
+# --------------------------------------------------------------------------- #
+class TestUnsupportedAmdCards:
+    """A real GPU that no local runtime can use must be reported as CPU-only.
+
+    The target laptop has a Radeon R5 M230 -- GCN 1.0, which ROCm has never
+    supported. Claiming it as an accelerator makes the planner size a model
+    against VRAM that will never be used and promises the user speed the
+    machine cannot deliver, so detection has to say so plainly.
+    """
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "Radeon R5 M230",
+            "AMD Radeon R7 M260DX",
+            "Radeon 520",
+            "Radeon 610 Mobile",
+            "AMD Radeon HD 8570M",
+        ],
+    )
+    def test_known_unsupported_families_are_rejected(self, name):
+        assert hardware.rocm_supports(name) is False
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "AMD Radeon RX 7900 XTX",
+            "AMD Radeon Instinct MI250",
+            "AMD Radeon Pro W6800",
+            "",
+        ],
+    )
+    def test_supported_and_unknown_cards_are_allowed(self, name):
+        """Unknown cards get the benefit of the doubt: a false negative here
+        would disable a GPU that actually works."""
+        assert hardware.rocm_supports(name) is True
+
+    def test_detect_reports_cpu_only_for_an_unsupported_card(self, monkeypatch):
+        monkeypatch.setattr(
+            hardware,
+            "detect_amd",
+            lambda: {"name": "Radeon R5 M230", "vram_gb": 2.0, "count": 1},
+        )
+        for probe in ("detect_nvidia", "detect_apple", "detect_tpu"):
+            monkeypatch.setattr(hardware, probe, lambda: None)
+
+        profile = hardware.detect()
+
+        assert profile.accelerator == "none"
+        assert profile.vram_gb == 0.0
+        assert "R5 M230" in profile.gpu_name
+        assert any("ROCm does not support" in n for n in profile.notes)
+
+    def test_a_supported_amd_card_is_still_reported_as_rocm(self, monkeypatch):
+        monkeypatch.setattr(
+            hardware,
+            "detect_amd",
+            lambda: {"name": "AMD Radeon RX 7900 XTX", "vram_gb": 24.0, "count": 1},
+        )
+        for probe in ("detect_nvidia", "detect_apple", "detect_tpu"):
+            monkeypatch.setattr(hardware, probe, lambda: None)
+
+        profile = hardware.detect()
+
+        assert profile.accelerator == "rocm"
+        assert profile.vram_gb == 24.0

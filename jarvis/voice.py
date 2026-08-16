@@ -412,6 +412,17 @@ class VoiceLoop:
     # ------------------------------------------------------------------ #
     def _handle(self, text: str) -> None:
         self._set_state(STATE_THINKING)
+
+        # Speak a holding line immediately. On a CPU-only box the main model
+        # can take a long time; without this the user hears nothing at all and
+        # reasonably concludes it is broken.
+        acknowledge = getattr(self.orchestrator, "acknowledge", None)
+        if callable(acknowledge):
+            try:
+                acknowledge()
+            except Exception:  # noqa: BLE001 - never let the filler break a turn
+                log.debug("acknowledgement failed", exc_info=True)
+
         try:
             reply = self.orchestrator.chat(text, speak=False)
         except Exception:  # noqa: BLE001
@@ -424,7 +435,7 @@ class VoiceLoop:
             except Exception:  # noqa: BLE001 - a UI callback must not end the loop
                 log.exception("on_reply callback failed")
 
-        self._speak(reply)
+        self._speak(reply, phrase=True, user_input=text)
 
         now = time.monotonic()
         # Allow a follow-up without the wake word.
@@ -462,14 +473,19 @@ class VoiceLoop:
     # ------------------------------------------------------------------ #
     #  Speaking, and being interrupted
     # ------------------------------------------------------------------ #
-    def _speak(self, text: str) -> None:
+    def _speak(self, text: str, *, phrase: bool = False, user_input: str = "") -> None:
         if not text:
             return
         self._set_state(STATE_SPEAKING)
         self._interrupted = False
         armed = self._arm_barge_in()
         try:
-            self.orchestrator.say(text)
+            try:
+                self.orchestrator.say(text, phrase=phrase, user_input=user_input)
+            except TypeError:
+                # An orchestrator (or test double) with the older say(text)
+                # signature.
+                self.orchestrator.say(text)
             self._await_speech_end()
         except Exception:  # noqa: BLE001
             log.exception("speech failed")

@@ -61,7 +61,7 @@ output. The summary is printed even if a later stage dies.
 | 10 | **Print the download plan** — every size, before anything downloads | — | — |
 | 11 | **Install the Ollama runtime**, rootless | ~1.4 GB compressed (amd64), read from the GitHub release | 3 GB in the shell, then the real check: 4× the download (6× for a zstd asset) + 200 MB |
 | 12 | **Start the Ollama server** — a pull goes through the running daemon | — | — |
-| 13 | **Pull the main model** (default `qwen3.6:27b`) | ~16.2 GB | 19 GB |
+| 13 | **Pull the main model** (default `qwen3.8:27b`) | ~18 GB | 21 GB |
 | 14 | **Pull the small interactive model** (`qwen3:4b-instruct-2507-q4_K_M`) | ~2.4 GB | 4 GB |
 | 15 | **Fetch the speech models** — Piper voice + faster-whisper | ~0.2 GB | 2 GB |
 | 16 | **vLLM** — only with `--vllm`, only on Linux with an NVIDIA GPU | several GB | 10 GB |
@@ -377,13 +377,13 @@ that changes system state outside your home directory.
 
 ## Choosing the model
 
-The default is `qwen3.6:27b`. It is the most capable thing that fits 32 GB at
+The default is `qwen3.8:27b`. It is the most capable thing that fits 32 GB at
 Q4, and on a CPU-only i5-class laptop it is also the slowest thing you could
 point a microphone at.
 
 | Ollama tag | Download | Params | Active per token | CPU throughput | Thinks first? |
 |---|---|---|---|---|---|
-| `qwen3.6:27b` *(default)* | ~16.2 GB | 27B dense | **27B** | **~1 tok/s** | **Yes**, by default |
+| `qwen3.8:27b` *(default)* | ~18 GB | 27B dense | **27B** | **~0.5-1 tok/s** | **Yes**, by default |
 | `qwen3:30b-a3b-instruct-2507-q4_K_M` | ~18.3 GB | 30.5B MoE | **~3.3B** | ~4–8 tok/s | No |
 | `qwen3:4b-instruct-2507-q4_K_M` | ~2.4 GB | 4B dense | 4B | ~15–25 tok/s | No |
 
@@ -396,7 +396,7 @@ fraction of its weights: `qwen3:30b-a3b` holds 30.5B parameters but touches only
 ~3.3B per token. That is why it is four to eight times faster than the 27B dense
 model while being *larger* on disk.
 
-On top of that, Qwen3.6 has thinking mode on by default and emits hundreds of
+On top of that, Qwen3.8 has thinking mode on by default and emits hundreds of
 `<think>` tokens before it says anything. At ~1 tok/s that is minutes of silence
 before the first word of the answer.
 
@@ -405,7 +405,7 @@ before the first word of the answer.
 - **Live voice → `qwen3:4b-instruct-2507-q4_K_M`.** 15–25 tok/s is the only
   setting that feels like a conversation. This is why the installer fetches it
   alongside the main model.
-- **Background subagents → `qwen3.6:27b` or `qwen3:30b-a3b`.** Nobody is waiting
+- **Background subagents → `qwen3.8:27b` or `qwen3:30b-a3b`.** Nobody is waiting
   on a background task, so quality is worth the wait. If you want one model for
   everything and can spare the extra 2 GB, `qwen3:30b-a3b` is the better single
   choice: near-27B quality at conversational-ish speed.
@@ -521,7 +521,7 @@ against the release before use.
 
 ```bash
 # connected machine
-ollama pull qwen3.6:27b
+ollama pull qwen3.8:27b
 ollama pull qwen3:4b-instruct-2507-q4_K_M
 tar -C ~/.ollama -czf ollama-models.tgz models
 
@@ -550,20 +550,20 @@ Both files must be present — the status check requires the `.onnx` *and* the
 
 ### 5. The speech-to-text model
 
-`base.en` is fetched into the Hugging Face hub cache the first time a
+`small.en` is fetched into the Hugging Face hub cache the first time a
 `WhisperModel` is constructed. Copy the cache directory across:
 
 ```bash
 # connected machine
-huggingface-cli download Systran/faster-whisper-base.en
-tar -C ~/.cache/huggingface/hub -czf whisper-base-en.tgz models--Systran--faster-whisper-base.en
+huggingface-cli download Systran/faster-whisper-small.en
+tar -C ~/.cache/huggingface/hub -czf whisper-small-en.tgz models--Systran--faster-whisper-small.en
 
 # target machine
 mkdir -p ~/.cache/huggingface/hub
-tar -C ~/.cache/huggingface/hub -xzf whisper-base-en.tgz
+tar -C ~/.cache/huggingface/hub -xzf whisper-small-en.tgz
 ```
 
-`models--guillaumekln--faster-whisper-base.en` is also recognised — that is where
+`models--guillaumekln--faster-whisper-small.en` is also recognised — that is where
 the same models lived before Systran took over publishing them. A directory
 counts as usable only when `model.bin`, `config.json` and `tokenizer.json` are
 all present, so an interrupted copy is reported as missing rather than as a
@@ -651,8 +651,8 @@ rm -rf ~/.local/share/jarvis/ollama ~/.local/share/jarvis/downloads
 rm -rf ~/.ollama
 
 # 5. Remove the speech-to-text model
-rm -rf ~/.cache/huggingface/hub/models--Systran--faster-whisper-base.en \
-       ~/.cache/huggingface/hub/models--guillaumekln--faster-whisper-base.en
+rm -rf ~/.cache/huggingface/hub/models--Systran--faster-whisper-small.en \
+       ~/.cache/huggingface/hub/models--guillaumekln--faster-whisper-small.en
 
 # 6. Remove the config, if you ever ran `jarvis config --write`
 rm -rf ~/.config/jarvis

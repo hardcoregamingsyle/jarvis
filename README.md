@@ -17,9 +17,10 @@ it still boots; each subsystem degrades rather than failing.
 
 | | |
 |---|---|
-| **Listens** | Offline speech-to-text — faster-whisper (`base.en` by default), Whisper, Vosk, or the Windows recogniser. Wake-word gating on the transcript, no second model |
+| **Listens** | Offline speech-to-text — faster-whisper (`small.en` by default, beam search, hallucination filtering), Whisper, Vosk, or the Windows recogniser. Wake-word gating on the transcript, no second model |
 | **Speaks** | British RP — Piper `en_GB-alan-medium` offline, edge-tts `en-GB-RyanNeural` online, or the OS voice. Barge-in: start talking and it stops mid-sentence |
-| **Thinks** | Any Hugging Face model, through vLLM, Ollama, any OpenAI-compatible server, transformers, or AirLLM. Default `Qwen/Qwen3.6-27B` |
+| **Thinks** | Any Hugging Face model, through vLLM, Ollama, any OpenAI-compatible server, transformers, or AirLLM. Default `Qwen/Qwen3.8-27B` |
+| **Speaks fast** | A second, small model (`qwen3:1.7b`) phrases the big model's answer for speech, so replies begin in under a second even when the 27B needs minutes |
 | **Remembers** | SQLite plus vector search. `memory.prune` is `false` — nothing is ever deleted, and recall spans every past conversation |
 | **Acts** | 72 built-in tools: files, shell, processes, services, apps, windows, keyboard, mouse, clipboard, screenshots, network |
 | **Delegates** | Long jobs become background subagents with their own tool access; the main agent answers you immediately and relays reports when they land |
@@ -288,10 +289,11 @@ systemctl --user import-environment DISPLAY XAUTHORITY WAYLAND_DISPLAY
 
 ## Quick start
 
-Run these four in order. Each proves a different half of the system.
+Run these in order. Each proves a different half of the system.
 
 ```bash
 jarvis doctor          # what is installed, what is missing, the exact fix for each
+jarvis selftest        # runs the whole pipeline and names the stage that is broken
 jarvis say             # auditions the voice — proves TTS and audio output
 jarvis chat            # text conversation — proves the model, memory and tools
 jarvis voice           # hands-free — proves the microphone, STT and the wake word
@@ -300,6 +302,7 @@ jarvis voice           # hands-free — proves the microphone, STT and the wake 
 | command | proves |
 |---|---|
 | `doctor` | Every optional dependency, every subsystem, the data directory. Start here whenever anything misbehaves — it prints the `pip install` line for each gap |
+| `selftest` | The other half of the question. `doctor` says what is *installed*; `selftest` runs each stage for real — hardware, LLM generation (with timings and tok/s), the voice model, STT, microphone, TTS, and a full agent turn — and tells you which link in the chain is broken. A failure in one stage does not stop the rest being reported |
 | `say` | The TTS engine was selected and audio reaches your speakers. It prints which engine won. `null` means none was usable |
 | `chat` | An LLM backend answered, memory opened, and the tool registry loaded. The banner shows the model, backend, voice and tool count |
 | `voice` | A microphone was found, speech-to-text works, and the wake word gates correctly. Say **"Jarvis"**; after a reply there is a 15-second window to follow up without repeating it |
@@ -367,47 +370,69 @@ a working spec, because that is how every new model starts life.
 | `qwen3-coder-30b-a3b` | `Qwen/Qwen3-Coder-30B-A3B-Instruct` | 30.5B | 3.3B | 256k | 18.3 GB |
 | `qwen3-235b-a22b` | `Qwen/Qwen3-235B-A22B-Instruct-2507` | 235B | 22B | 256k | 141 GB |
 | `llama3.1-8b` | `meta-llama/Llama-3.1-8B-Instruct` | 8B | dense | 128k | 4.9 GB — **gated** |
-| **`qwen3.6-27b`** | `Qwen/Qwen3.6-27B` | 27B | dense | **256k** | 16.1 GB |
-| `qwen3.8-27b` | `Qwen/Qwen3.8-27B` | — | — | — | **not released** |
+| `qwen3.6-27b` | `Qwen/Qwen3.6-27B` | 27B | dense | **256k** | 16.1 GB |
+| **`qwen3.8-27b`** | `Qwen/Qwen3.8-27B` | 27B | dense | **256k** | 18.0 GB |
 
-The default is **`qwen3.6-27b`** (`Qwen/Qwen3.6-27B`): a dense 27B
-vision-language model with a 262,144-token native context, extensible to about
-1M with YaRN. It is the most capable thing that still fits 32 GB at Q4 (~16 GB),
-and it accepts images and video as well as text. It needs `transformers >= 4.57`
-for the `Qwen3_5` architecture, and it **thinks by default**, emitting a
-`<think>…</think>` block before every answer.
+The default is **`qwen3.8-27b`** (`Qwen/Qwen3.8-27B`), released 14 August 2026
+under Apache 2.0: a dense 27B vision-language model with a 262,144-token native
+context, extensible to about 1M with YaRN. It is the most capable thing that
+still fits 32 GB at Q4 (~18 GB), and it accepts images and video as well as
+text. It needs `transformers >= 4.57`, and it **thinks by default**.
 
-Be aware of the trade-off before pointing a microphone at it. Dense means all
-27B parameters are read for every token, where `qwen3-30b-a3b` activates only
-~3.3B. On a CPU-only laptop that is roughly **1 tok/s against 4–8**, and the
-default thinking block multiplies the wait. For live conversation on such a
-machine, set `llm.model: Qwen/Qwen3-4B-Instruct-2507` and leave Qwen3.6 to
-background subagents — or serve it from a GPU box over vLLM and point
-`llm.vllm_host` at it. `jarvis model recommend` will tell you the same thing:
-it ranks by *active* parameters, not total.
+Dense means all 27B parameters are read for every token, where `qwen3-30b-a3b`
+activates only ~3.3B. On a CPU-only laptop that is roughly **0.5–1 tok/s against
+4–8**. A forty-word spoken reply is therefore two to four minutes.
 
-The mixture-of-experts alternative, `qwen3-30b-a3b`, gives 30B of knowledge for
-~3B of arithmetic per token. On a CPU-only 32 GB laptop that shape is roughly
-ten times faster than the dense 32B for the same download size. Full reasoning, the
-quantisation arithmetic and the context-vs-RAM tables are in
-[docs/MODELS.md](docs/MODELS.md).
+You do not have to choose between capable and responsive. See
+[The two-model voice pipeline](#the-two-model-voice-pipeline) below: the 27B
+does the thinking, and a 1.7B model speaks the result while it works.
 
-### About `Qwen3.8-27B`
+`jarvis model recommend` ranks by *active* parameters, not total, and will steer
+a CPU-only machine towards the mixture-of-experts `qwen3-30b-a3b` — 30B of
+knowledge for ~3B of arithmetic per token. Full reasoning, the quantisation
+arithmetic and the context-vs-RAM tables are in [docs/MODELS.md](docs/MODELS.md).
 
-**It is not released. No such repository exists on Hugging Face.** It is listed
-in `KNOWN_MODELS` with `exists=False` and placeholder figures, on purpose, so
-that asking for it produces a straight answer instead of a 404 or a "did you
-mean" guess:
+### The two-model voice pipeline
 
-```
-Qwen3.8 27B (unreleased) (Qwen/Qwen3.8-27B) is not released yet: no such model
-exists, so it cannot be selected. ... When it is published, set exists=True for
-the 'qwen3.8-27b' entry in jarvis/llm/models.py and it becomes selectable
-immediately.
-```
+A dense 27B on four CPU cores cannot hold a conversation on its own. Rather than
+downgrade the brain, JARVIS splits the job:
 
-When it ships, that is the whole migration: flip `exists=True`, correct the
-numbers, set `llm.model`. One line of config for users, one line of code here.
+| | model | job | speed |
+|---|---|---|---|
+| **The brain** | `llm.model` — Qwen3.8-27B | reasoning, tool calls, decisions | 0.5–1 tok/s |
+| **The voice** | `llm.voice_model` — Qwen3 1.7B | phrases the finished answer for speech | 15–30 tok/s |
+
+What you hear:
+
+1. You finish speaking. The transcript is gated on the wake word.
+2. **Immediately** — a short acknowledgement ("One moment, Sir"), so the pause
+   that follows reads as deliberation rather than a crash.
+3. The 27B works. It may take as long as it needs.
+4. Its answer goes to the 1.7B, which renders it as one or two spoken British
+   sentences in well under a second.
+5. Piper speaks them **sentence by sentence**, so audio starts on the first full
+   stop instead of after the last.
+
+The voice model never decides anything — it is handed the finished answer and
+asked only to phrase it. If it returns something implausibly longer than what it
+was given, that output is discarded and the brain's own wording is spoken
+instead. A fast invention is worse than a slow truth.
+
+Turn it off with `llm.voice_model_enabled: false` and the main model speaks for
+itself, correctly but slowly.
+
+### Thinking mode, and the silent-reply trap
+
+Qwen3.x ships with chain-of-thought **on**. Left alone on a CPU box it spends
+the entire `max_new_tokens` budget inside a `<think>` block that never closes,
+the reasoning is correctly stripped, and the assistant answers with **nothing at
+all** — the single most common cause of "JARVIS never replies".
+
+`llm.thinking: auto` (the default) disables it for model families known to
+reason by default. Two further safety nets: any reply that is *only* reasoning
+has usable prose salvaged from it rather than being discarded, and the agent
+loop strips reasoning markup itself rather than trusting the backend to have
+done it. `jarvis selftest` reports this stage explicitly.
 
 ### Pinning a revision
 
@@ -417,7 +442,7 @@ changes the weights beneath a working deployment.
 
 ```yaml
 llm:
-  model: Qwen/Qwen3.6-27B
+  model: Qwen/Qwen3.8-27B
   model_revision: "9a1b2c3..."     # commit SHA, branch or tag
 ```
 
@@ -970,6 +995,7 @@ docs/           architecture, operations, models, tool authoring, testing, troub
 | | |
 |---|---|
 | [docs/INSTALL.md](docs/INSTALL.md) | The complete installation reference: every stage and its disk cost, every flag, every path written, rootless Ollama, air-gapped installs, uninstall |
+| [docs/SETUP_MY_LAPTOP.md](docs/SETUP_MY_LAPTOP.md) | A worked setup for a 4-core CPU-only laptop on XFCE/X11: the one `sudo` line, realistic tok/s, what to tune, and what to expect |
 | [docs/UPDATING.md](docs/UPDATING.md) | What re-running the installer updates, what it deliberately leaves alone, and how to roll back |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How the pieces fit: the agent loop, the task tree, the event bus |
 | [docs/MODELS.md](docs/MODELS.md) | Qwen3 family, dense vs MoE, quantisation, context vs RAM, adding a model |

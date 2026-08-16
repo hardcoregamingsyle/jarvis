@@ -29,6 +29,7 @@ from ..core.contracts import (
     ToolResult,
 )
 from ..core.events import EventBus, Events
+from ..llm.base import salvage_thinking, strip_thinking
 from .prompts import build_subagent_prompt
 from .protocol import ToolCall, parse_tool_calls, render_tool_result, strip_tool_calls
 from .task_manager import DEFAULT_MAX_DEPTH
@@ -195,7 +196,16 @@ def run_agent_loop(
 
         # -- no tool calls: this is the answer ------------------------------ #
         if not calls:
-            answer = strip_tool_calls(raw).strip() or _fallback_answer(turn)
+            # Backends normally strip reasoning themselves, but this loop is
+            # the last thing between a model and a speaker, so it never
+            # assumes that happened: raw <think> markup must not be read out.
+            answer = strip_tool_calls(strip_thinking(raw)).strip()
+            if not answer:
+                # A thinking model that ran out of budget mid-reasoning leaves
+                # nothing outside the <think> block. Salvage the reasoning as
+                # prose before falling back to an apology.
+                answer = strip_tool_calls(salvage_thinking(raw)).strip()
+            answer = answer or _fallback_answer(turn)
             messages.append(Message.assistant(answer))
             turn.text = answer
             return turn
@@ -249,7 +259,10 @@ def run_agent_loop(
     )
     try:
         final = llm.generate(messages, gen_config).text
-        answer = strip_tool_calls(final).strip() or _fallback_answer(turn)
+        answer = strip_tool_calls(strip_thinking(final)).strip()
+        if not answer:
+            answer = strip_tool_calls(salvage_thinking(final)).strip()
+        answer = answer or _fallback_answer(turn)
     except Exception as exc:  # noqa: BLE001
         log.exception("final generation failed")
         answer = f"I ran out of steps before finishing, and the model then failed: {exc}"

@@ -381,6 +381,38 @@ def _rocm_sysfs_present() -> bool:
     return False
 
 
+# AMD GPU families that ROCm has never supported, or dropped long ago. A card
+# from one of these is real hardware that genuinely cannot run a language
+# model, and reporting it as an "accelerator" is worse than reporting nothing:
+# it makes the planner size a model for VRAM that will never be used, and it
+# tells the user they have acceleration they do not have.
+#
+# These are the low-end mobile GCN 1.0/2.0 parts still common in 2019-2020
+# laptops (the R5 M230 in the target machine among them). ROCm requires GFX8+
+# in practice, and Ollama's ROCm build refuses them outright.
+_ROCM_UNSUPPORTED_MARKERS = (
+    "r5 m2", "r7 m2", "r5 m3", "r7 m3",     # M230/M260/M330/M340/M360...
+    "radeon 520", "radeon 530", "radeon 535",
+    "radeon 610", "radeon 620", "radeon 625",
+    "hd 8", "r5 graphics", "r4 graphics",
+    "oland", "hainan", "mars", "exo", "sun ",
+    "caicos", "turks", "cedar", "redwood", "juniper",
+)
+
+
+def rocm_supports(gpu_name: Any) -> bool:
+    """False when ``gpu_name`` is an AMD part ROCm cannot drive.
+
+    Conservative: an unrecognised card is assumed supported, because a false
+    negative here would disable a GPU that works. Only the families that are
+    definitively unsupported are listed.
+    """
+    name = str(gpu_name or "").strip().lower()
+    if not name:
+        return True
+    return not any(marker in name for marker in _ROCM_UNSUPPORTED_MARKERS)
+
+
 _ROCM_VRAM_PREFIX = "VRAM Total Memory (B)"
 
 
@@ -639,6 +671,21 @@ def detect() -> HardwareProfile:
         gpu_name = str(nvidia.get("name") or "")
         gpu_count = int(nvidia.get("count") or 0)
         vram = float(nvidia.get("vram_gb") or 0.0)
+    elif amd is not None and not rocm_supports(amd.get("name")):
+        # A real AMD GPU that ROCm cannot drive. Reporting it as an
+        # accelerator would make the planner size a model against VRAM that
+        # will never be used, and would promise the user acceleration the
+        # machine cannot deliver. Report the card, plan for CPU.
+        gpu_name = str(amd.get("name") or "")
+        gpu_count = int(amd.get("count") or 0)
+        notes.append(
+            f"An AMD GPU ({gpu_name or 'unknown model'}) is present, but it "
+            "belongs to a family ROCm does not support, so no local runtime "
+            "can use it for inference. Planning for CPU only. This is a "
+            "limitation of the card, not of the configuration -- the GPU is "
+            "fine for display and video decode, just not for running a "
+            "language model."
+        )
     elif amd is not None:
         accelerator, vendor = "rocm", "amd"
         gpu_name = str(amd.get("name") or "")

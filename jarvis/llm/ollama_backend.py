@@ -15,7 +15,13 @@ from urllib import request as _urlrequest
 
 from ..core.contracts import GenerationConfig, LLMResult, Message
 from ..core.config import LLMConfig
-from .base import BaseLLM, apply_stop_strings, strip_thinking
+from .base import (
+    BaseLLM,
+    apply_stop_strings,
+    salvage_thinking,
+    strip_thinking,
+    wants_thinking_disabled,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -33,6 +39,10 @@ class OllamaBackend(BaseLLM):
         self._host = (cfg.ollama_host or "http://127.0.0.1:11434").rstrip("/")
         self._model = cfg.ollama_model or cfg.model
         self._timeout = float(cfg.request_timeout or 600.0)
+        # None = leave the model's own default alone; False = explicitly off.
+        self._think: Optional[bool] = (
+            False if wants_thinking_disabled(self._model) else None
+        )
 
     # -- HTTP helpers ------------------------------------------------------- #
     def _url(self, path: str) -> str:
@@ -84,12 +94,20 @@ class OllamaBackend(BaseLLM):
         return options
 
     def _payload(self, messages: Sequence[Message], gen: GenerationConfig, *, stream: bool) -> dict:
-        return {
+        payload = {
             "model": self._model,
             "messages": [m.to_dict() for m in messages],
             "stream": bool(stream),
             "options": self._build_options(gen),
         }
+        # Qwen3.x reasons by default and will spend the entire num_predict
+        # budget inside an unclosed <think> block, leaving nothing to say. On
+        # a CPU-only box that is not a quality trade-off, it is the difference
+        # between an answer and silence. Ollama exposes this as a top-level
+        # boolean; older daemons ignore an unknown key rather than erroring.
+        if self._think is False:
+            payload["think"] = False
+        return payload
 
     # -- generate ----------------------------------------------------------- #
     def generate(
@@ -110,11 +128,21 @@ class OllamaBackend(BaseLLM):
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"Ollama returned invalid JSON: {exc}") from exc
 
-        text = ""
+        raw_text = ""
         message = data.get("message") if isinstance(data, dict) else None
         if isinstance(message, dict):
-            text = str(message.get("content") or "")
-        text = strip_thinking(text)
+            raw_text = str(message.get("content") or "")
+            # Newer daemons return reasoning on its own field rather than in
+            # <think> tags; it must never be spoken as the answer.
+            if not raw_text:
+                thinking = message.get("thinking") or message.get("reasoning")
+                if thinking:
+                    raw_text = f"<think>{thinking}"
+        text = strip_thinking(raw_text)
+        if not text:
+            # The whole budget went into reasoning. Salvage prose from it
+            # rather than hand the agent loop an empty string.
+            text = salvage_thinking(raw_text)
         text = apply_stop_strings(text, gen.stop)
 
         finish = "stop"

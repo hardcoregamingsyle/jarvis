@@ -437,7 +437,7 @@ unbounded fan-out cannot take the machine down.
 | `memory.recall_k` | 8 | Recollections injected per turn | Prompts are long; each recollection is a full stored record |
 | `memory.keep_recent_turns` | 8 | Live turns kept verbatim | Same |
 | `memory.summarize_after_turns` | 20 | When the window is compressed | Lower it to keep prompts short |
-| `stt.model` | `base.en` | Whisper size | `tiny.en` if transcription lags; `small.en` if accuracy matters more than latency |
+| `stt.model` | `small.en` | Whisper size | `tiny.en` if transcription lags; `small.en` if accuracy matters more than latency |
 | `stt.compute_type` | `int8` | Whisper quantisation | Already the fast setting; leave it |
 
 A conservative CPU-only Linux profile:

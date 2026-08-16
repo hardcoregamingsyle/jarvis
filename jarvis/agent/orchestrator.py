@@ -49,6 +49,7 @@ class Orchestrator:
         tts: Any = None,
         bus: Optional[EventBus] = None,
         task_manager: Optional[TaskManager] = None,
+        voice_model: Any = None,
     ) -> None:
         self.config = config
         self.llm = llm
@@ -56,6 +57,11 @@ class Orchestrator:
         self.context = context
         self.tts = tts
         self.bus = bus or get_bus()
+        # The small, fast model that phrases replies for speech. Optional: when
+        # absent the main model's own prose is spoken instead. Built lazily so
+        # constructing an Orchestrator never blocks on a second backend probe.
+        self._voice_model = voice_model
+        self._voice_model_ready = voice_model is not None
 
         # Tree limits are resource management, not permission: they stop one
         # mis-prompted agent turning into a fork bomb.  Read defensively because
@@ -157,11 +163,80 @@ class Orchestrator:
 
         self.bus.emit(Events.ASSISTANT_REPLY, reply)
         if speak if speak is not None else self._speaking_enabled:
-            self.say(reply)
+            self.say(reply, phrase=True, user_input=user_input)
         return reply
 
-    def say(self, text: str) -> None:
-        """Speak a line, if a voice is configured.  Never raises."""
+    # ------------------------------------------------------------------ #
+    #  The voice model
+    # ------------------------------------------------------------------ #
+    @property
+    def voice_model(self) -> Any:
+        """The small model that phrases replies aloud, or ``None``.
+
+        Built on first use rather than in ``__init__`` so that constructing an
+        Orchestrator never pays for a second backend probe, and so a machine
+        with no small model available simply never builds one.
+        """
+        if not self._voice_model_ready:
+            self._voice_model_ready = True
+            try:
+                from ..llm.voice_model import create_voice_model
+
+                self._voice_model = create_voice_model(
+                    self.config.llm,
+                    agent_name=self.config.agent.name,
+                    user_title=self.config.agent.user_title,
+                )
+            except Exception:  # noqa: BLE001 - an optional layer, never fatal
+                log.debug("voice model unavailable", exc_info=True)
+                self._voice_model = None
+        return self._voice_model
+
+    def acknowledge(self) -> str:
+        """Speak a holding line while the main model thinks.
+
+        This is what stops a slow local model reading as a crash: the user
+        hears a reply within a fraction of a second, and the real answer
+        follows when it is ready. Returns the line spoken, or ``""``.
+        """
+        model = self.voice_model
+        if model is None:
+            return ""
+        try:
+            line = model.acknowledge()
+        except Exception:  # noqa: BLE001
+            log.debug("acknowledgement failed", exc_info=True)
+            return ""
+        if line:
+            self.say(line, phrase=False)
+        return line
+
+    def say(self, text: str, *, phrase: bool = False, user_input: str = "") -> None:
+        """Speak a line, if a voice is configured.  Never raises.
+
+        With ``phrase=True`` the text is first handed to the voice model to be
+        rendered as spoken prose; that path is used for real answers, not for
+        acknowledgements and greetings which are already speech-shaped.
+        """
+        if not text:
+            return
+
+        if phrase:
+            model = self.voice_model
+            if model is not None:
+                try:
+                    text = model.speakable(text, user_input=user_input) or text
+                except Exception:  # noqa: BLE001 - fall back to the raw answer
+                    log.debug("voice-model phrasing failed", exc_info=True)
+            else:
+                # No voice model: still strip markdown, which is never spoken.
+                try:
+                    from ..llm.voice_model import strip_markup
+
+                    text = strip_markup(text) or text
+                except Exception:  # noqa: BLE001
+                    log.debug("markup stripping failed", exc_info=True)
+
         if not text:
             return
         self.bus.emit(Events.SPEAK, text)

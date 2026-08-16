@@ -594,3 +594,98 @@ def test_module_imports_without_heavy_deps(monkeypatch):
     # Reload should still succeed.
     reloaded = importlib.reload(tts)
     assert reloaded.NullTTS is not None
+
+
+# --------------------------------------------------------------------------- #
+#  Sentence streaming
+# --------------------------------------------------------------------------- #
+class RecordingEngine(TTSEngine):
+    """Records what it was asked to speak, in order."""
+
+    name = "recording"
+
+    def __init__(self) -> None:
+        self.spoken: list = []
+
+    def is_available(self) -> bool:
+        return True
+
+    def synthesize(self, text: str) -> bytes:
+        return b"RIFF"
+
+    def speak(self, text: str) -> None:
+        self.spoken.append(text)
+
+
+class TestSentenceSplitting:
+    """Speech has to begin on the first sentence, not the last.
+
+    Piper takes roughly as long to synthesise as the audio lasts, so speaking
+    a paragraph as one buffer means seconds of silence first. Splitting also
+    makes barge-in responsive: unspoken sentences can simply be dropped.
+    """
+
+    def test_sentences_are_separated(self):
+        assert tts.split_sentences("It is half past four, Sir. Shall I set a reminder?") == [
+            "It is half past four, Sir.",
+            "Shall I set a reminder?",
+        ]
+
+    def test_a_short_complete_sentence_stands_alone(self):
+        """"Done, Sir." is a whole thought and must not be glued to the next."""
+        assert tts.split_sentences("Done, Sir. The file is saved.") == [
+            "Done, Sir.",
+            "The file is saved.",
+        ]
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Dr. Hall called about the results.",
+            "Mr. Stark is in the workshop.",
+            "It arrives at 4 p.m. today.",
+            "Check the CPU, GPU, etc. before rebooting.",
+        ],
+    )
+    def test_abbreviations_do_not_end_a_sentence(self, text):
+        """Splitting on "Dr." puts a pause in the middle of a name."""
+        assert tts.split_sentences(text) == [text]
+
+    def test_question_and_exclamation_marks_also_terminate(self):
+        assert tts.split_sentences("Ready? Let's go!") == ["Ready?", "Let's go!"]
+
+    def test_a_very_long_sentence_is_broken_on_a_clause(self):
+        text = (
+            "The system is running normally, all services are up and responding "
+            "to health checks, disk usage is at sixty two percent across both "
+            "volumes, memory is comfortable with plenty of headroom, and there "
+            "is nothing at all that needs your attention right now, Sir."
+        )
+        chunks = tts.split_sentences(text)
+        assert len(chunks) > 1, "a 250+ character sentence defeats streaming"
+        assert all(len(c) <= 260 for c in chunks)
+        # Nothing may be lost in the split.
+        rejoined = " ".join(chunks).replace("  ", " ")
+        assert rejoined.replace(" ", "") == text.replace(" ", "")
+
+    @pytest.mark.parametrize("text", ["", "   ", "\n"])
+    def test_empty_input_yields_nothing(self, text):
+        assert tts.split_sentences(text) == []
+
+    def test_text_without_punctuation_survives_intact(self):
+        assert tts.split_sentences("no punctuation here") == ["no punctuation here"]
+
+    def test_the_queue_enqueues_each_sentence_separately(self):
+        """The whole point: the first sentence reaches the engine immediately."""
+        engine = RecordingEngine()
+        q = tts.SpeechQueue(engine)
+        try:
+            q.say("It is half past four, Sir. Shall I set a reminder?")
+            q.wait(timeout=5.0)
+        finally:
+            q.shutdown(timeout=5.0)
+
+        assert engine.spoken == [
+            "It is half past four, Sir.",
+            "Shall I set a reminder?",
+        ]

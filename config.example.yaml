@@ -20,15 +20,21 @@ llm:
   backend: auto
 
   # Any Hugging Face repo id. `jarvis model list` shows the known aliases.
-  #   Qwen/Qwen3.6-27B                  — DEFAULT. Dense 27B, vision+text, 262K
-  #                                       context, ~16 GB at Q4. The strongest
+  #   Qwen/Qwen3.8-27B                  — DEFAULT. Dense 27B, vision+text, 262K
+  #                                       context, ~18 GB at Q4. The strongest
   #                                       model that fits 32 GB — but dense, so
-  #                                       ~1 tok/s on CPU, and it thinks before
-  #                                       answering. Needs transformers >= 4.57.
+  #                                       ~0.5-1 tok/s on CPU, and it thinks
+  #                                       before answering. Needs
+  #                                       transformers >= 4.57.
+  #   Qwen/Qwen3.6-27B                  — the previous default; same shape.
   #   Qwen/Qwen3-30B-A3B-Instruct-2507  — MoE, ~3B active/token, ~4-8 tok/s on CPU.
   #   Qwen/Qwen3-4B-Instruct-2507       — the one that feels like conversation.
   #   Qwen/Qwen3-32B                    — dense, smarter, considerably slower.
-  model: Qwen/Qwen3.6-27B
+  #
+  # NOTE: on a CPU-only box you do NOT have to choose between "capable" and
+  # "responsive" — see `voice_model` below, which puts a small fast model in
+  # front of this one so replies begin speaking immediately.
+  model: Qwen/Qwen3.8-27B
 
   compression: ""            # "" | 4bit | 8bit  (needs bitsandbytes + CUDA)
   layer_shards_dir: ""       # defaults to <data dir>/models
@@ -42,10 +48,42 @@ llm:
 
   # Install from https://ollama.com  (winget install Ollama.Ollama)
   ollama_host: http://127.0.0.1:11434
-  #   qwen3.6:27b                         ~16 GB,  ~1 tok/s     (most capable)
+  #   qwen3.8:27b                         ~18 GB,  ~0.5-1 tok/s  (most capable)
   #   qwen3:30b-a3b-instruct-2507-q4_K_M  ~19 GB,  ~4-8 tok/s    (background)
   #   qwen3:4b-instruct-2507-q4_K_M       ~2.5 GB, ~15-25 tok/s  (interactive)
-  ollama_model: qwen3.6:27b
+  ollama_model: qwen3.8:27b
+
+  # Chain-of-thought. Qwen3.x reasons by DEFAULT and will happily spend the
+  # entire max_new_tokens budget inside a <think> block, returning nothing at
+  # all — the single most common cause of "JARVIS never answers".
+  #   auto — off for families known to reason by default (recommended)
+  #   on   — force it on; expect long silences on CPU
+  #   off  — always off
+  thinking: auto
+
+  # -- The voice model ------------------------------------------------------
+  # The trick that makes a slow local brain feel instant. The big model above
+  # does the thinking and the tool work; this small one turns the result into
+  # the sentence that is actually spoken. A 1.7B model runs at 15-30 tok/s on a
+  # CPU, so speech begins in well under a second while the big model is still
+  # working.
+  #
+  # It never decides anything: it is given the finished answer and asked only
+  # to phrase it. If it returns something implausibly longer than what it was
+  # given, the original wording is spoken instead.
+  #
+  # Set voice_model_enabled: false (or voice_model: "") to have the main model
+  # speak for itself.
+  #   qwen3:1.7b   ~1.1 GB, very fast, quite sufficient for phrasing
+  #   qwen3:0.6b   ~0.5 GB, faster still, occasionally clumsy
+  #   qwen3:4b-instruct-2507-q4_K_M  ~2.5 GB, best phrasing, still quick
+  voice_model: qwen3:1.7b
+  voice_model_enabled: true
+  voice_max_new_tokens: 160
+  voice_temperature: 0.5
+  # Speak a short holding line ("One moment, Sir") the instant a request is
+  # understood, so the wait reads as deliberation rather than a crash.
+  voice_ack_enabled: true
 
   allow_fallback: true
   request_timeout: 600.0
@@ -59,20 +97,49 @@ stt:
   #   all, but noticeably less accurate than whisper. It exists so voice works
   #   on a machine with nothing installed.
   engine: auto
-  model: base.en             # tiny.en | base.en | small.en | medium.en
+  # tiny.en | base.en | small.en | medium.en
+  # small.en is the accuracy sweet spot: ~3x the compute of base.en but far
+  # fewer word errors, and still comfortably real-time at int8 on four cores.
+  # Drop to base.en if the machine is busy.
+  model: small.en
   device: auto
   compute_type: int8         # int8 is roughly twice as fast on CPU
   language: en
   sample_rate: 16000
   vad_filter: true
 
+  # -- Decoding quality -----------------------------------------------------
+  # Greedy decoding (beam_size 1) is what makes small Whisper models sound
+  # useless: they commit to a bad first token and never recover.
+  beam_size: 5
+  # Whisper conditions on its own previous output by default, so one mistake
+  # propagates through the whole session. This is the classic cause of
+  # runaway repeated text.
+  condition_on_previous_text: false
+  # Biases the decoder towards words it will actually hear. Proper nouns are
+  # what a small model gets wrong, and if "Jarvis" is misheard the wake word
+  # never fires at all.
+  initial_prompt: "Jarvis, the British AI assistant."
+  cpu_threads: 0             # 0 = use every core
+  no_speech_threshold: 0.6
+  log_prob_threshold: -1.0
+  # Whisper reliably invents "Thank you." / "Thanks for watching!" over silence
+  # and background noise. Discard those when they are the whole transcript.
+  filter_hallucinations: true
+
   # Voice activity detection — how the end of your sentence is detected.
   # MEASURED ON THIS MACHINE: the room's noise floor is about 0.007, so 0.021
   # (three times the floor) is a safer threshold than the 0.015 default.
   # Run `jarvis calibrate` to measure your own room.
   silence_threshold: 0.015
-  silence_duration: 0.9      # seconds of quiet that end an utterance
+  # 0.9s cuts people off mid-thought: anyone who pauses to think gets their
+  # sentence truncated and only half of it transcribed.
+  silence_duration: 1.2      # seconds of quiet that end an utterance
   max_utterance_seconds: 30.0
+  # Audio kept from *before* speech was detected, so the first syllable of the
+  # wake word survives instead of arriving as "-arvis".
+  preroll_seconds: 0.5
+  min_speech_seconds: 0.3    # shorter bursts are coughs and clicks
   input_device: null         # null = system default; `jarvis doctor` lists them
 
 # ---------------------------------------------------------------------------
