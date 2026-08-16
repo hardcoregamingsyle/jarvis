@@ -65,16 +65,16 @@ class LLMConfig:
 
     # "airllm", "ollama", "transformers", "stub", or "auto".
     backend: str = "auto"
-    # Qwen3.6-27B: dense 27B, vision-language, 262K native context. The most
-    # capable model that still fits 32 GB at Q4 (~16 GB), and it needs
-    # transformers >= 4.57 for the Qwen3_5 architecture.
+    # Qwen3.8-27B: dense 27B, vision-language, 262K native context, Apache 2.0.
+    # The most capable model that still fits 32 GB at Q4 (~18 GB); it needs
+    # transformers >= 4.57.
     #
     # Being DENSE is the trade-off: every one of the 27B parameters is read per
     # token, where Qwen3-30B-A3B activates only ~3B. On a CPU-only box that is
-    # roughly 1 tok/s against 4-8. It also thinks by default, emitting hundreds
-    # of <think> tokens before it answers. For live voice on such a machine,
-    # prefer `qwen3-4b` here and leave this one to background subagents.
-    model: str = "Qwen/Qwen3.6-27B"
+    # roughly 0.5-1 tok/s against 4-8. This is why `voice_model` below exists:
+    # the big model reasons, a small one speaks, and the conversation stays
+    # responsive regardless of how long the thinking takes.
+    model: str = "Qwen/Qwen3.8-27B"
     # AirLLM streams layers from disk; this is where they get cached.
     compression: str = ""            # "" | "4bit" | "8bit"  (needs bitsandbytes)
     layer_shards_dir: str = ""       # defaults to <data>/models
@@ -86,7 +86,7 @@ class LLMConfig:
     context_tokens: int = 8192
     # Ollama fallback settings
     ollama_host: str = "http://127.0.0.1:11434"
-    ollama_model: str = "qwen3.6:27b"
+    ollama_model: str = "qwen3.8:27b"
     # OpenAI-compatible server (vLLM and friends); see the class docstring.
     vllm_host: str = "http://127.0.0.1:8000/v1"
     api_key: str = ""
@@ -100,20 +100,90 @@ class LLMConfig:
     allow_fallback: bool = True
     request_timeout: float = 600.0
 
+    # -- Thinking / reasoning ---------------------------------------------- #
+    # Qwen3.x ships with chain-of-thought ON. A dense 27B on a CPU spends the
+    # entire token budget inside <think> and returns an empty answer, which is
+    # the single most common cause of "JARVIS never replies". "auto" turns it
+    # off for model families known to reason by default (see
+    # jarvis.llm.models.THINKING_DEFAULT_ON); "on" forces it; "off" always
+    # disables it. Background subagents may still reason — see
+    # AgentConfig.subagent_thinking.
+    thinking: str = "auto"           # "auto" | "on" | "off"
+
+    # -- The voice model ---------------------------------------------------- #
+    # The trick that makes a slow local brain feel instant. The big model above
+    # does the thinking and the tool work; this small one turns its result into
+    # the sentence that actually gets spoken, and it starts speaking while the
+    # big model is still working. A 1.7-3B model runs at 15-30 tok/s on a CPU,
+    # so the reply begins in well under a second.
+    #
+    # Empty voice_model disables the split entirely and the main model speaks
+    # for itself.
+    voice_model: str = "qwen3:1.7b"
+    voice_model_enabled: bool = True
+    # Voice replies are one or two spoken sentences; they never need more.
+    voice_max_new_tokens: int = 160
+    voice_temperature: float = 0.5
+    # Spoken immediately, before the main model has finished. Keeps the
+    # conversation alive instead of leaving dead air.
+    voice_ack_enabled: bool = True
+
 
 @dataclass
 class STTConfig:
+    """Speech in. Defaults tuned for accuracy on a 4-core CPU with 32 GB RAM.
+
+    ``model`` is the single biggest lever on transcription quality.
+    ``small.en`` is roughly 3x the compute of ``base.en`` but makes far fewer
+    word errors, and at int8 on four cores it still transcribes a five-second
+    utterance in well under a second -- comfortably real-time. On a machine
+    with less headroom, drop to ``base.en``.
+    """
+
     engine: str = "auto"             # "auto" | "faster-whisper" | "whisper" | "vosk" | "stub"
-    model: str = "base.en"           # tiny.en/base.en/small.en — base.en is the sweet spot on CPU
+    # tiny.en < base.en < small.en < medium.en. small.en is the accuracy sweet
+    # spot when there is RAM to spare; base.en if you need the speed back.
+    model: str = "small.en"
     device: str = "auto"
     compute_type: str = "int8"       # int8 is ~2x faster on CPU with negligible loss
     language: str = "en"
     sample_rate: int = 16000
     vad_filter: bool = True
-    # Voice activity / recording behaviour
+
+    # -- Decoding quality --------------------------------------------------- #
+    # Greedy decoding (beam_size=1) is what makes small Whisper models sound
+    # "trash": it commits to a bad first token and never recovers. 5 is the
+    # reference default and costs little on short utterances.
+    beam_size: int = 5
+    # Whisper conditions on its own previous output by default, which makes a
+    # single mistake propagate through the rest of the session and is the
+    # classic cause of runaway repeated text.
+    condition_on_previous_text: bool = False
+    # Biases the decoder towards the words it will actually hear. Proper nouns
+    # are exactly what a small model gets wrong, and "Jarvis" is the one word
+    # that must survive -- misheard, the wake word never fires.
+    initial_prompt: str = "Jarvis, the British AI assistant."
+    # 0 = use every core. Left at 0 the CTranslate2 default is often 1 thread.
+    cpu_threads: int = 0
+    # Segments the model is this unsure about are dropped rather than guessed.
+    no_speech_threshold: float = 0.6
+    log_prob_threshold: float = -1.0
+    # Whisper reliably hallucinates stock phrases over silence and noise
+    # ("Thank you.", "Thanks for watching!"). Filter them out of short
+    # transcripts; see jarvis.speech.stt.HALLUCINATIONS.
+    filter_hallucinations: bool = True
+
+    # -- Voice activity / recording behaviour ------------------------------- #
     silence_threshold: float = 0.015
-    silence_duration: float = 0.9    # seconds of quiet that ends an utterance
+    # 0.9s cuts people off mid-thought; anyone who pauses to think gets their
+    # sentence truncated and half-transcribed.
+    silence_duration: float = 1.2
     max_utterance_seconds: float = 30.0
+    # Audio kept from *before* speech was detected, so the first syllable of
+    # the wake word is not clipped off.
+    preroll_seconds: float = 0.5
+    # Shorter bursts are coughs, clicks and door slams, not speech.
+    min_speech_seconds: float = 0.3
     input_device: Optional[int] = None
 
 

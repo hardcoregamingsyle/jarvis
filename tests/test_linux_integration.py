@@ -124,8 +124,17 @@ def xdg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 # --------------------------------------------------------------------------- #
 #  Inert on the wrong host
 # --------------------------------------------------------------------------- #
-def test_modules_are_inert_on_a_real_windows_box():
-    """No fakes at all: the real dev host must get honest negatives, not errors."""
+def test_modules_are_inert_on_a_non_linux_box(monkeypatch):
+    """On the wrong host every probe must answer honestly, not raise.
+
+    The host is faked rather than assumed: this suite has to give the same
+    result whether it runs on the Windows development box or on the Linux
+    laptop that is the production target. Asserting against the *real* host
+    made every one of these assertions fail the moment the suite moved to
+    Linux, which is exactly backwards for a Linux-only module.
+    """
+    fake_host(monkeypatch, FakeShell(tools=("apt-get", "pactl", "systemctl")), linux=False)
+
     assert service.is_available() is False
     assert audio.is_available() is False
     assert audio.backend() == "none"
@@ -150,8 +159,12 @@ def test_modules_are_inert_on_a_real_windows_box():
     assert capabilities["autostart"] is False
 
 
-def test_operations_refuse_on_windows_without_touching_the_filesystem(xdg: Path):
+def test_operations_refuse_on_a_non_linux_box_without_touching_the_filesystem(
+    xdg: Path, monkeypatch
+):
     """A Linux-only operation fails with an explanation and writes nothing."""
+    fake_host(monkeypatch, FakeShell(tools=("systemctl", "wmctrl")), linux=False)
+
     result = service.install()
     assert result.ok is False
     assert "Linux-only" in (result.error or "")
@@ -193,7 +206,12 @@ def test_a_raising_shell_does_not_escape_any_probe(monkeypatch):
     assert service.is_available() is False
     assert audio.backend() == "none"
     assert audio.list_input_devices() == []
-    assert audio.in_audio_group() is None
+    # `id` blew up, so this falls back to asking libc directly. On a real
+    # POSIX host that succeeds and gives a definite answer, which is better
+    # than None; on a host without the `grp` module it gives None. Both are
+    # correct -- the contract being tested is "never raises", not a
+    # particular value.
+    assert audio.in_audio_group() in (None, True, False)
     assert desktop.notify("t", "m") == "log"
     assert isinstance(audio.check(), dict)
     assert isinstance(service.status(), dict)

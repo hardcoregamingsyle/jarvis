@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import replace
-from typing import Iterator, List, Optional, Sequence
+from typing import Any, Iterator, List, Optional, Sequence
 
 from ..core.contracts import (
     GenerationConfig,
@@ -69,6 +69,8 @@ _THINK_CLOSED = re.compile(r"<think>[\s\S]*?</think>", re.IGNORECASE)
 # thought contains a "<" character, which happens routinely with code snippets.
 _THINK_UNCLOSED_TRAILER = re.compile(r"<think>[\s\S]*$", re.IGNORECASE)
 _THINK_EXTRACT = re.compile(r"<think>([\s\S]*?)</think>", re.IGNORECASE)
+# Any stray opening or closing tag, for cleaning salvaged fragments.
+_THINK_TAG_RE = re.compile(r"</?think>", re.IGNORECASE)
 
 
 def strip_thinking(text: str) -> str:
@@ -78,6 +80,63 @@ def strip_thinking(text: str) -> str:
     cleaned = _THINK_CLOSED.sub("", text)
     cleaned = _THINK_UNCLOSED_TRAILER.sub("", cleaned)
     return cleaned.strip()
+
+
+def salvage_thinking(text: str) -> str:
+    """Recover something sayable from a reply that is *only* reasoning.
+
+    The failure this exists for is the single most common way a thinking model
+    goes mute: generation hits ``max_new_tokens`` while still inside an
+    unclosed ``<think>``, so :func:`strip_thinking` correctly returns ``""``
+    and the agent loop has no answer to speak. Silence is the worst possible
+    output for a voice assistant, so rather than discard the tokens we were
+    charged for, we salvage the tail of the reasoning as prose.
+
+    Returns ``""`` when there is genuinely nothing to salvage, so callers can
+    still fall back to their own message.
+    """
+    if not text:
+        return ""
+
+    # Anything outside the thinking blocks always wins.
+    outside = strip_thinking(text)
+    if outside:
+        return outside
+
+    interior = extract_thinking(text) or ""
+    if not interior:
+        match = _THINK_UNCLOSED_TRAILER.search(text)
+        interior = match.group(0)[len("<think>"):] if match else ""
+    # An empty pair of tags leaves a stray closing tag behind, which must
+    # never reach a speaker.
+    interior = _THINK_TAG_RE.sub("", interior).strip()
+    if not interior:
+        return ""
+
+    # Keep only complete sentences: a truncated model stops mid-word, and
+    # reading a half-word aloud sounds broken rather than thoughtful.
+    sentences = re.findall(r"[^.!?]*[.!?]", interior)
+    if sentences:
+        salvaged = " ".join(s.strip() for s in sentences[-3:] if s.strip())
+    else:
+        salvaged = interior
+    return salvaged.strip()
+
+
+def wants_thinking_disabled(model: Any) -> bool:
+    """True when ``model`` is a family that reasons by default.
+
+    Qwen3, Qwen3.5, Qwen3.6 and Qwen3.8 all ship with thinking enabled and
+    burn hundreds of tokens before emitting a single word of the answer. On a
+    CPU-only box that is the difference between a reply in seconds and no
+    reply at all, so every backend turns it off for interactive turns.
+    """
+    name = str(model or "").strip().lower()
+    if not name:
+        return False
+    from .models import THINKING_DEFAULT_ON
+
+    return any(family in name for family in THINKING_DEFAULT_ON)
 
 
 def extract_thinking(text: str) -> Optional[str]:

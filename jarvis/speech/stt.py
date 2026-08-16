@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 from pathlib import Path
 from typing import Any, List, Optional, Sequence, Tuple
 
@@ -24,6 +25,70 @@ log = logging.getLogger(__name__)
 
 
 _TARGET_SR = 16000
+
+# Whisper emits these over silence, breathing and background noise with high
+# confidence -- they are memorised from the subtitle corpora it was trained on,
+# not heard. A voice assistant that acts on "Thanks for watching!" every time
+# the fridge compressor starts is worse than one that mishears occasionally, so
+# a *short* transcript consisting only of one of these is discarded.
+#
+# Matched after lowercasing and stripping punctuation. Deliberately conservative:
+# every entry is a phrase no one plausibly says to an assistant on its own.
+HALLUCINATIONS = frozenset({
+    "thank you",
+    "thanks for watching",
+    "thanks for watching!",
+    "thank you for watching",
+    "thank you very much",
+    "you",
+    "bye",
+    "bye bye",
+    "okay",
+    "ok",
+    "oh",
+    "mm",
+    "mmm",
+    "hmm",
+    "uh",
+    "um",
+    "ah",
+    "so",
+    "the",
+    "please subscribe",
+    "subscribe to my channel",
+    "like and subscribe",
+    "see you next time",
+    "see you in the next video",
+    "i'm going to go ahead and put that in the oven",
+    "transcription by castingwords",
+    "subtitles by the amara.org community",
+    "www.mooji.org",
+})
+
+# Above this many characters a transcript is assumed to be genuine speech even
+# if it happens to open with one of the phrases above. Sized to fit the longest
+# entry in HALLUCINATIONS -- a listed phrase that can never match would be a
+# quiet lie about what is actually filtered.
+_HALLUCINATION_MAX_CHARS = 48
+
+
+def _looks_hallucinated(text: str) -> bool:
+    """True when ``text`` is one of Whisper's stock phrases and nothing more.
+
+    Only ever applied to short transcripts: "thank you" as a complete utterance
+    is almost always noise, while "thank you, that worked" is a real thing to
+    say and must survive.
+    """
+    if not text:
+        return False
+    stripped = text.strip()
+    if len(stripped) > _HALLUCINATION_MAX_CHARS:
+        return False
+    normalised = re.sub(r"[^\w\s']", "", stripped).strip().lower()
+    normalised = re.sub(r"\s+", " ", normalised)
+    if not normalised:
+        return True
+    return normalised in HALLUCINATIONS
 
 
 # --------------------------------------------------------------------------- #
@@ -99,14 +164,40 @@ class FasterWhisperSTT(STTEngine):
             from faster_whisper import WhisperModel  # type: ignore
         except ImportError:
             return
+        device = self._resolve_device()
+        compute_type = self.cfg.compute_type
+        # float16 is a GPU format; CTranslate2 refuses it on CPU. Silently
+        # correcting this is better than a load failure that reads as "STT is
+        # broken" when the only problem is one config line.
+        if device == "cpu" and str(compute_type).lower() in ("float16", "fp16", "half"):
+            log.info("compute_type %r is GPU-only; using int8 on CPU.", compute_type)
+            compute_type = "int8"
+
+        kwargs: dict = {"device": device, "compute_type": compute_type}
+        threads = int(getattr(self.cfg, "cpu_threads", 0) or 0)
+        if threads <= 0:
+            # CTranslate2 defaults to a single thread in several builds, which
+            # makes transcription several times slower than the hardware allows.
+            import os
+
+            threads = max(1, (os.cpu_count() or 4))
+        if device == "cpu":
+            kwargs["cpu_threads"] = threads
+
         try:
-            self._model = WhisperModel(
-                self.cfg.model,
-                device=self._resolve_device(),
-                compute_type=self.cfg.compute_type,
-            )
+            self._model = WhisperModel(self.cfg.model, **kwargs)
         except Exception as exc:
             log.warning("faster-whisper load failed: %s", exc)
+            # An unknown or undownloadable model name is the usual cause. Fall
+            # back to one that is certain to exist rather than going mute.
+            fallback = "base.en"
+            if str(self.cfg.model) != fallback:
+                log.info("retrying faster-whisper with %r", fallback)
+                try:
+                    self._model = WhisperModel(fallback, **kwargs)
+                    return
+                except Exception as exc2:
+                    log.warning("faster-whisper fallback load failed: %s", exc2)
             self._model = None
 
     def transcribe(self, audio: Any, sample_rate: int = 16000) -> Transcript:
@@ -127,12 +218,37 @@ class FasterWhisperSTT(STTEngine):
         except ImportError:
             arr = samples  # type: ignore
 
+        # Quality knobs, all defaulted in STTConfig. Passed through **kwargs so
+        # an older faster-whisper that lacks one of them still runs (see the
+        # TypeError retry below) rather than refusing to transcribe at all.
+        options: dict = {
+            "vad_filter": self.cfg.vad_filter,
+            "language": self.cfg.language or None,
+            "beam_size": int(getattr(self.cfg, "beam_size", 5) or 5),
+            "condition_on_previous_text": bool(
+                getattr(self.cfg, "condition_on_previous_text", False)
+            ),
+            "no_speech_threshold": float(getattr(self.cfg, "no_speech_threshold", 0.6)),
+            "log_prob_threshold": float(getattr(self.cfg, "log_prob_threshold", -1.0)),
+        }
+        prompt = str(getattr(self.cfg, "initial_prompt", "") or "").strip()
+        if prompt:
+            options["initial_prompt"] = prompt
+
         try:
-            seg_iter, info = self._model.transcribe(
-                arr,
-                vad_filter=self.cfg.vad_filter,
-                language=self.cfg.language or None,
-            )
+            seg_iter, info = self._model.transcribe(arr, **options)
+        except TypeError as exc:
+            # An older build that does not know one of the newer keywords.
+            log.debug("faster-whisper rejected an option (%s); retrying plainly", exc)
+            try:
+                seg_iter, info = self._model.transcribe(
+                    arr,
+                    vad_filter=self.cfg.vad_filter,
+                    language=self.cfg.language or None,
+                )
+            except Exception as exc2:
+                log.warning("faster-whisper transcribe failed: %s", exc2)
+                return _empty_transcript()
         except Exception as exc:
             log.warning("faster-whisper transcribe failed: %s", exc)
             return _empty_transcript()
@@ -163,8 +279,14 @@ class FasterWhisperSTT(STTEngine):
 
         conf = sum(confidences) / len(confidences) if confidences else 1.0
         language = getattr(info, "language", None) or self.cfg.language
+        text = " ".join(t.strip() for t in text_parts).strip()
+
+        if getattr(self.cfg, "filter_hallucinations", True) and _looks_hallucinated(text):
+            log.debug("discarding a likely Whisper hallucination: %r", text)
+            return _empty_transcript(language)
+
         return Transcript(
-            text=" ".join(t.strip() for t in text_parts).strip(),
+            text=text,
             language=language,
             confidence=conf,
             segments=tuple(structured),
@@ -236,6 +358,11 @@ class WhisperSTT(STTEngine):
                 arr,
                 language=self.cfg.language or None,
                 fp16=False,
+                beam_size=int(getattr(self.cfg, "beam_size", 5) or 5),
+                condition_on_previous_text=bool(
+                    getattr(self.cfg, "condition_on_previous_text", False)
+                ),
+                initial_prompt=str(getattr(self.cfg, "initial_prompt", "") or "") or None,
             )
         except Exception as exc:
             log.warning("whisper transcribe failed: %s", exc)
@@ -261,6 +388,9 @@ class WhisperSTT(STTEngine):
                     pass
 
         conf = sum(confidences) / len(confidences) if confidences else 1.0
+        if getattr(self.cfg, "filter_hallucinations", True) and _looks_hallucinated(raw_text):
+            log.debug("discarding a likely Whisper hallucination: %r", raw_text)
+            return _empty_transcript(language)
         return Transcript(
             text=raw_text,
             language=language,

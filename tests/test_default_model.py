@@ -1,14 +1,14 @@
 """The default model, and the facts that justify the figures next to it.
 
-Every number here was read from the Hugging Face API and the repo's own
-``config.json`` on 2026-08-08, not estimated:
+The default is Qwen3.8-27B, released 2026-08-14 under Apache 2.0:
 
-* 15 safetensors shards, 55.6 GB in bf16, ungated
-* ``model_type`` ``qwen3_5``, architecture ``Qwen3_5ForConditionalGeneration``
-* 64 layers, hidden 5120, GQA 24 heads / 4 KV heads
-* ``max_position_embeddings`` 262144
-* a vision tower alongside the text tower (image and video token ids present)
-* Q4_K_S GGUF measured at 16.1 GB; Ollama publishes ``qwen3.6:27b``
+* 27,781,427,952 stored parameters (marketed as 27B), dense
+* 64 decoder layers: 48 Gated DeltaNet linear-attention + 16 full-attention
+* hidden 5120, FFN 17408, GQA 24 query heads / 4 KV heads
+* ``max_position_embeddings`` 262144, extensible to ~1M via YaRN
+* a vision tower alongside the text tower (image and video in)
+* Ollama publishes an 18 GB package as ``qwen3.8:27b``
+* thinking is ON by default, which JARVIS disables for interactive turns
 
 Nothing in this file touches the network — the point is to pin what the
 catalogue *claims*, so a future edit cannot quietly drift from the weights.
@@ -25,23 +25,23 @@ from jarvis.core.config import Config, LLMConfig, load_config
 from jarvis.llm.models import (
     DEFAULT_ALIAS,
     KNOWN_MODELS,
-    UnreleasedModelError,
+    THINKING_DEFAULT_ON,
     recommend,
     resolve,
 )
 
 
-DEFAULT_REPO = "Qwen/Qwen3.6-27B"
+DEFAULT_REPO = "Qwen/Qwen3.8-27B"
 
 
-def test_the_default_is_qwen3_6_27b():
+def test_the_default_is_qwen3_8_27b():
     assert LLMConfig().model == DEFAULT_REPO
-    assert DEFAULT_ALIAS == "qwen3.6-27b"
+    assert DEFAULT_ALIAS == "qwen3.8-27b"
     assert resolve(DEFAULT_ALIAS).id == DEFAULT_REPO
 
 
 def test_the_default_is_selectable():
-    """It exists, so unlike Qwen3.8 it must resolve rather than raise."""
+    """It is released, so it must resolve rather than raise."""
     spec = resolve(DEFAULT_ALIAS)
     assert spec.exists is True
     assert spec.gated is False
@@ -51,8 +51,23 @@ def test_the_verified_specification():
     spec = resolve(DEFAULT_ALIAS)
     assert spec.params == pytest.approx(27.0)
     assert spec.context == 262144
-    assert spec.quantised_size_gb == pytest.approx(16.1, abs=0.5)
-    assert spec.ollama_tag == "qwen3.6:27b"
+    assert spec.quantised_size_gb == pytest.approx(18.0, abs=0.5)
+    assert spec.ollama_tag == "qwen3.8:27b"
+
+
+def test_the_ollama_tag_matches_the_configured_one():
+    """The catalogue tag and the config default must not drift apart."""
+    assert LLMConfig().ollama_model == resolve(DEFAULT_ALIAS).ollama_tag
+
+
+def test_the_default_family_is_known_to_reason_by_default():
+    """The thinking-by-default list is what stops silent replies.
+
+    If the default model's family ever falls off THINKING_DEFAULT_ON, the
+    runtime stops disabling chain-of-thought and every spoken reply becomes an
+    unclosed <think> block — i.e. silence. Pin it.
+    """
+    assert any(f in DEFAULT_REPO.lower() for f in THINKING_DEFAULT_ON)
 
 
 def test_it_is_dense_not_mixture_of_experts():
@@ -73,12 +88,11 @@ def test_the_notes_warn_about_the_dense_cpu_cost():
     assert "think" in notes, "thinking-by-default is the other latency trap"
 
 
-def test_qwen3_8_is_still_listed_but_unselectable():
-    """It is not released; listing it is useful, selecting it is not."""
-    assert "qwen3.8-27b" in KNOWN_MODELS
-    assert KNOWN_MODELS["qwen3.8-27b"].exists is False
-    with pytest.raises(UnreleasedModelError):
-        resolve("qwen3.8-27b")
+def test_the_previous_default_is_still_available():
+    """Qwen3.6-27B remains in the catalogue as a fallback for anyone pinned to it."""
+    spec = resolve("qwen3.6-27b")
+    assert spec.id == "Qwen/Qwen3.6-27B"
+    assert spec.exists is True
 
 
 def test_recommend_still_prefers_the_moe_for_cpu_only_work():

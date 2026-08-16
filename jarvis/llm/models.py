@@ -296,23 +296,45 @@ KNOWN_MODELS: Dict[str, ModelSpec] = {
         ollama_tag="qwen3.6:27b",
         exists=True,
     ),
+    # Released 2026-08-14, 15:00 UTC, Apache 2.0. Dense 27B vision-language
+    # model: 27,781,427,952 stored parameters, 64 decoder layers (48 Gated
+    # DeltaNet linear-attention + 16 full-attention), hidden 5120, FFN 17408,
+    # GQA 24 query / 4 KV heads, 262,144 native context extensible to ~1M via
+    # YaRN. Ollama publishes an 18 GB package. Thinking is ON by default with
+    # reasoning_effort defaulting to "xhigh" — see THINKING_DEFAULT_ON below,
+    # which is what stops that turning every spoken reply into silence.
     "qwen3.8-27b": ModelSpec(
         id="Qwen/Qwen3.8-27B",
-        label="Qwen3.8 27B (unreleased)",
+        label="Qwen3.8 27B (dense, vision-language)",
         params=27.0,
         family="qwen3",
         context=262144,
-        quantised_size_gb=16.2,
-        notes="Not released yet — the repository is not publicly readable. "
-              "Figures are placeholders. Its released predecessor is "
-              "qwen3.6-27b, which is the current default; switching when 3.8 "
-              "ships means flipping exists=False here.",
+        # Ollama ships 18 GB for both the standard and MLX variants.
+        quantised_size_gb=18.0,
+        notes=(
+            "The strongest dense model that still fits 32 GB at Q4, and "
+            "multimodal (image and video in). DENSE, though: all 27B "
+            "parameters are read per token, so on a CPU-only box expect "
+            "roughly 0.5-1 tok/s against 4-8 for the 30B-A3B MoE, which "
+            "activates only ~3B. Thinking mode is ON by default and emits "
+            "hundreds of reasoning tokens before answering — JARVIS disables "
+            "it for interactive turns. Serve with Ollama GGUF on CPU, or "
+            "vLLM/SGLang on a GPU. Needs transformers >= 4.57."
+        ),
         backends=_ALL_BACKENDS,
-        exists=False,
+        ollama_tag="qwen3.8:27b",
+        exists=True,
     ),
 }
 
-DEFAULT_ALIAS = "qwen3.6-27b"
+DEFAULT_ALIAS = "qwen3.8-27b"
+
+# Model families that ship with chain-of-thought enabled by default. For these
+# the runtime MUST explicitly turn thinking off on interactive turns, or the
+# generation budget is spent entirely inside an unclosed <think> block and the
+# user gets silence. Matched case-insensitively as a substring of the model id
+# or tag; see jarvis.llm.base.wants_thinking_disabled.
+THINKING_DEFAULT_ON = ("qwen3", "qwen3.5", "qwen3.6", "qwen3.8")
 
 # Populated at the end of the module, once the normalisation helper exists.
 _ID_INDEX: Dict[str, str] = {}

@@ -37,7 +37,33 @@ from jarvis.llm.models import (
 
 # A token shaped exactly like the real thing, and used nowhere but here.
 FAKE_TOKEN = "hf_QRSTuvwx0123456789ABCDefghIJKLmnop"
-UNRELEASED_ALIAS = "qwen3.8-27b"
+
+# The "announced but not shipped" machinery has to keep working, but pinning it
+# to a real catalogue entry means these tests break every time that model
+# actually ships (as qwen3.8-27b just did). So the fixture below installs a
+# purely fictional entry instead, and the behaviour is tested against that.
+UNRELEASED_ALIAS = "test-unreleased-99b"
+UNRELEASED_REPO = "Qwen/Qwen-Test-Unreleased-99B"
+
+
+@pytest.fixture(autouse=True)
+def unreleased_entry(monkeypatch: pytest.MonkeyPatch):
+    """Add a fictional unreleased model to the catalogue for the duration."""
+    spec = models.ModelSpec(
+        id=UNRELEASED_REPO,
+        label="Qwen Test Unreleased 99B",
+        params=99.0,
+        family="qwen3",
+        context=32768,
+        quantised_size_gb=59.0,
+        notes="Fictional entry used only to exercise the unreleased-model path.",
+        backends=("ollama", "transformers"),
+        exists=False,
+        alias=UNRELEASED_ALIAS,
+    )
+    monkeypatch.setitem(KNOWN_MODELS, UNRELEASED_ALIAS, spec)
+    monkeypatch.setitem(models._ID_INDEX, UNRELEASED_REPO.lower(), UNRELEASED_ALIAS)
+    return spec
 
 
 @pytest.fixture(autouse=True)
@@ -112,7 +138,7 @@ def test_a_string_that_is_not_a_model_reference_is_refused(bad):
 
 def test_the_unreleased_model_is_listed_but_cannot_be_selected():
     listed = {spec.id for spec in all_models()}
-    assert "Qwen/Qwen3.8-27B" in listed, "an unavailable target must still be visible"
+    assert UNRELEASED_REPO in listed, "an unavailable target must still be visible"
 
     known = lookup(UNRELEASED_ALIAS)
     assert known is not None and known.exists is False
@@ -121,32 +147,32 @@ def test_the_unreleased_model_is_listed_but_cannot_be_selected():
         resolve(UNRELEASED_ALIAS)
     message = str(excinfo.value).lower()
     assert "not released" in message
-    assert "qwen3.8-27b" in message
+    assert UNRELEASED_ALIAS in message
     # The suggested alternative must itself be real.
     assert resolve("qwen3-30b-a3b").exists is True
 
 
 def test_the_unreleased_model_is_refused_by_its_full_repo_id_too():
     with pytest.raises(UnreleasedModelError):
-        resolve("Qwen/Qwen3.8-27B")
+        resolve(UNRELEASED_REPO)
 
 
 def test_unreleased_models_can_still_be_inspected_deliberately():
     spec = resolve(UNRELEASED_ALIAS, allow_unreleased=True)
     assert spec.exists is False
-    assert spec.id == "Qwen/Qwen3.8-27B"
+    assert spec.id == UNRELEASED_REPO
 
 
 def test_flipping_the_exists_flag_is_the_entire_release_change(monkeypatch):
     """The promise: when it ships, one flag makes it selectable."""
     shipped = dataclasses.replace(KNOWN_MODELS[UNRELEASED_ALIAS], exists=True)
     monkeypatch.setitem(KNOWN_MODELS, UNRELEASED_ALIAS, shipped)
-    assert resolve(UNRELEASED_ALIAS).id == "Qwen/Qwen3.8-27B"
+    assert resolve(UNRELEASED_ALIAS).id == UNRELEASED_REPO
 
 
 def test_all_models_can_hide_the_unreleased_entries():
     released = {spec.id for spec in all_models(include_unreleased=False)}
-    assert "Qwen/Qwen3.8-27B" not in released
+    assert UNRELEASED_REPO not in released
     assert "Qwen/Qwen3-8B" in released
 
 
