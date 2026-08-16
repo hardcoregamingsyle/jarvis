@@ -1021,6 +1021,13 @@ ollama_model=$MAIN_TAG"
         SET_LINES="$SET_LINES
 model=$MODEL_ID"
     fi
+    # Record the voice model too. Pulling it without pointing the config at it
+    # would leave the two-model split silently switched off, which is exactly
+    # the "capable but unusably slow" configuration it exists to avoid.
+    if [ "$WANT_MODEL" -eq 1 ] && [ -n "$VOICE_TAG" ]; then
+        SET_LINES="$SET_LINES
+voice_model=$VOICE_TAG"
+    fi
 
     set +e
     JARVIS_SET_MODEL="$SET_LINES" JARVIS_CONFIG_FILE="$ROOT/config.yaml" "$VPY" - <<'PYEOF'
