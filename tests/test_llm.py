@@ -562,3 +562,91 @@ def test_llm_modules_import_without_heavy_deps():
     import jarvis.llm.transformers_backend  # noqa: F401
     import jarvis.llm.stub_backend  # noqa: F401
     assert hasattr(pkg, "create_llm")
+
+
+# --------------------------------------------------------------------------- #
+#  Oversized prompts
+# --------------------------------------------------------------------------- #
+class TestOversizedMessages:
+    """A single message can exceed the whole window, and often does.
+
+    Reading a large source file or datasheet is ordinary work. If the
+    transcript is sent unmodified the *server* truncates it — from the front,
+    silently, taking the system prompt and frequently the question with it.
+    Trimming here is visible, ordered and logged.
+    """
+
+    def test_a_single_huge_message_is_elided_not_dropped(self):
+        from jarvis.llm.base import ELISION_MARKER  # noqa: F401
+
+        msgs = [Message.system("sys"), Message.user("x" * 400_000)]
+        out = trim_to_context(msgs, 8192)
+
+        assert out[0].role == Role.SYSTEM, "the system prompt must survive"
+        assert "elided" in out[-1].content
+        assert sum(len(m.content) for m in out) // 4 <= 8192
+
+    def test_the_head_and_tail_both_survive(self):
+        """A file's structure is at the top and its conclusion at the bottom;
+        cutting either end alone loses one of them."""
+        body = "HEAD_MARKER\n" + ("filler line\n" * 50_000) + "TAIL_MARKER"
+        out = trim_to_context([Message.user(body)], 4096)
+        assert "HEAD_MARKER" in out[-1].content
+        assert "TAIL_MARKER" in out[-1].content
+
+    def test_an_absurd_budget_leaves_content_untouched(self):
+        """Below a usable budget, mangling the question helps nobody."""
+        original = "hi there this is a long user turn " * 20
+        out = trim_to_context([Message.system("s"), Message.user(original)], 1)
+        assert out[-1].content == original
+
+    def test_a_message_that_fits_is_not_modified(self):
+        out = trim_to_context([Message.user("short")], 8192)
+        assert out[-1].content == "short"
+
+
+class TestContextFitting:
+    """`_fit` is what stops an oversized transcript reaching the server."""
+
+    def test_backends_trim_before_sending(self):
+        from jarvis.core.config import LLMConfig
+        from jarvis.llm.ollama_backend import OllamaBackend
+
+        cfg = LLMConfig(context_tokens=4096, max_new_tokens=512)
+        backend = OllamaBackend(cfg)
+        msgs = [Message.system("sys")] + [
+            Message.user("x" * 4000) for _ in range(20)
+        ]
+        fitted = backend._fit(msgs)
+
+        assert len(fitted) < len(msgs)
+        assert sum(len(m.content) for m in fitted) // 4 <= 4096
+
+    def test_room_is_reserved_for_the_reply(self):
+        """A prompt that exactly fills the window leaves nothing to generate
+        into, and the model returns an empty string."""
+        from jarvis.core.config import LLMConfig
+        from jarvis.llm.ollama_backend import OllamaBackend
+
+        cfg = LLMConfig(context_tokens=4096, max_new_tokens=1024)
+        backend = OllamaBackend(cfg)
+        fitted = backend._fit([Message.user("x" * 100_000)])
+        assert sum(len(m.content) for m in fitted) // 4 <= 4096 - 1024 + 10
+
+    def test_a_zero_window_disables_trimming(self):
+        from jarvis.core.config import LLMConfig
+        from jarvis.llm.ollama_backend import OllamaBackend
+
+        backend = OllamaBackend(LLMConfig(context_tokens=0))
+        msgs = [Message.user("x" * 50_000)]
+        assert backend._fit(msgs) == msgs
+
+
+def test_the_default_window_suits_engineering_work():
+    """8k could not hold one large source file plus a conversation."""
+    from jarvis.core.config import LLMConfig
+
+    cfg = LLMConfig()
+    assert cfg.context_tokens >= 32768
+    # And one tool result must not be able to consume all of it.
+    assert cfg.max_tool_result_tokens < cfg.context_tokens
