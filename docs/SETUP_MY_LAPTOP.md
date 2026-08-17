@@ -71,6 +71,62 @@ no `curl | sh`, no system service), and pulls:
 | Piper `en_GB-alan-medium` | ~60 MB | The British voice |
 | faster-whisper `small.en` | ~500 MB | Transcription |
 
+### Upgrading from an earlier install? Read this
+
+`config.yaml` is **yours** — it is gitignored, and the installer will never
+silently overwrite your model choice. That is correct behaviour, but it has one
+consequence that surprises people:
+
+> If you installed before Qwen3.8 became the default, your `config.yaml` still
+> pins `qwen3.6:27b`, and `./install.sh` will keep pulling **3.6**, not 3.8.
+
+The installer now says so explicitly:
+
+```
+config.yaml pins llm.ollama_model: qwen3.6:27b
+This release defaults to qwen3.8:27b. Keeping your setting.
+To switch:  ./install.sh --model qwen3.8:27b
+```
+
+To take the new default:
+
+```bash
+./install.sh --model qwen3.8:27b
+```
+
+Or edit `config.yaml` by hand and re-run:
+
+```yaml
+llm:
+  model: Qwen/Qwen3.8-27B
+  ollama_model: qwen3.8:27b
+```
+
+Then reclaim the 18 GB the old model is using:
+
+```bash
+ollama rm qwen3.6:27b
+```
+
+### Want the 27B at 3-4 tok/s? Use llama.cpp with a draft model
+
+Ollama is simplest but caps at ~1.5 tok/s on a dense 27B. Speculative decoding
+roughly doubles-to-triples that **at identical output quality** — a 0.6B model
+proposes tokens, the 27B verifies four at a time in one pass:
+
+```bash
+jarvis serve-plan       # prints the exact llama-server command for your box
+```
+
+| Acceptance | tok/s |
+|---|---|
+| 60% | 3.3 |
+| 70% | 4.0 |
+| 80% | 4.8 |
+
+Needs llama.cpp built (Ollama does not expose `--model-draft`). Full setup in
+[PERFORMANCE.md](PERFORMANCE.md#speculative-decoding-2-3x-no-quality-cost).
+
 ### If 25 GB is too much
 
 Skip the 27B and run the mixture-of-experts model instead. On your CPU it is
@@ -134,10 +190,11 @@ jarvis voice          # hands-free — say "Jarvis"
 This is the part most setup guides lie about, so here are real numbers for
 4 cores at Q4:
 
-| | Qwen3.8-27B (dense) | Qwen3-30B-A3B (MoE) |
-|---|---|---|
-| Speed | ~0.5–1 tok/s | ~4–8 tok/s |
-| 40-word reply | **2–4 minutes** | ~15–30 seconds |
+| | 27B via Ollama | **27B + draft (llama.cpp)** | Qwen3-30B-A3B (MoE) |
+|---|---|---|---|
+| Speed | ~1.5 tok/s | **~3.3–4.8 tok/s** | ~12 tok/s |
+| 40-word reply | ~35 s | **~12 s** | ~5 s |
+| Quality | full | **full (identical)** | comparable |
 
 The two-model split is what makes the first column survivable. Per turn:
 
