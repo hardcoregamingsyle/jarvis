@@ -602,6 +602,7 @@ def action_status():
 
 ACTIONS = {
     "configured-tag": action_configured_tag,
+    "default-tag": action_default_tag,
     "resolve-tag": action_resolve_tag,
     "model-size": action_model_size,
     "ollama": action_ollama,
@@ -1017,6 +1018,22 @@ if [ "$WANT_MODEL" -eq 1 ] && [ "$PROFILE" != "min" ]; then
     else
         MAIN_TAG="$(runtime_capture configured-tag)"
         [ -n "$MAIN_TAG" ] || MAIN_TAG="$FALLBACK_MAIN_TAG"
+
+        # An existing config.yaml is honoured -- it is your choice of model and
+        # an installer must not silently swap it. But when it names a model this
+        # release has moved on from, saying nothing is worse: you asked for an
+        # upgrade and got the previous model with no explanation. So we tell
+        # you, and give you the one command that switches.
+        DEFAULT_TAG="$(runtime_capture default-tag)"
+        if [ -n "$DEFAULT_TAG" ] && [ "$MAIN_TAG" != "$DEFAULT_TAG" ]; then
+            warn "config.yaml pins llm.ollama_model: $MAIN_TAG"
+            warn "This release defaults to $DEFAULT_TAG. Keeping your setting."
+            warn "To switch:  ./install.sh --model $DEFAULT_TAG"
+            warn "Or edit llm.ollama_model in config.yaml and re-run."
+            # No summary line here: the main model IS still pulled a few stages
+            # below, and it records its own. Claiming "skipped" would be a
+            # plain lie about what the run did.
+        fi
     fi
 fi
 
