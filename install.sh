@@ -402,6 +402,22 @@ def action_configured_tag():
     return CHANGED if tag.strip() else FAILED
 
 
+def action_default_tag():
+    """The Ollama tag this version of JARVIS ships as its default.
+
+    Read from the catalogue rather than duplicated in shell, so the installer
+    and the package can never disagree about which model is current.
+    """
+    try:
+        from jarvis.llm import models
+        tag = str(models.KNOWN_MODELS[models.DEFAULT_ALIAS].ollama_tag or "")
+    except Exception as exc:
+        say("could not read the default model from the catalogue (%s)" % exc)
+        return FAILED
+    sys.stdout.write(tag + "\n")
+    return CHANGED if tag else FAILED
+
+
 def action_resolve_tag():
     """Map a Hugging Face repo id onto the Ollama tag that serves it."""
     if ":" in ARG:
