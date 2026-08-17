@@ -352,3 +352,68 @@ def test_the_factory_refuses_a_stub_backend(monkeypatch):
 
     monkeypatch.setattr("jarvis.llm.create_llm", lambda cfg, **k: Stub("canned"))
     assert create_voice_model(LLMConfig(voice_model="qwen3:1.7b")) is None
+
+
+# --------------------------------------------------------------------------- #
+#  CPU tuning
+# --------------------------------------------------------------------------- #
+class TestCpuTuning:
+    """Dense CPU inference is memory-bandwidth bound, not compute bound.
+
+    Hyperthreaded siblings share one memory port, so running 8 threads on 4
+    physical cores has them contending for the exact resource that is already
+    the bottleneck. Ollama's default is all logical processors; physical is
+    measurably better.
+    """
+
+    def test_thread_count_prefers_physical_cores(self, monkeypatch, tmp_path):
+        from jarvis.llm import ollama_backend
+
+        # An i5-10210U: 8 logical processors across 4 physical cores.
+        cpuinfo = tmp_path / "cpuinfo"
+        cpuinfo.write_text(
+            "".join(
+                f"processor\t: {i}\ncore id\t\t: {i % 4}\n\n" for i in range(8)
+            )
+        )
+        real_open = open
+
+        def fake_open(path, *args, **kwargs):
+            if str(path) == "/proc/cpuinfo":
+                return real_open(cpuinfo, *args, **kwargs)
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", fake_open)
+        assert ollama_backend._default_thread_count() == 4
+
+    def test_it_halves_logical_cores_when_topology_is_unreadable(self, monkeypatch):
+        from jarvis.llm import ollama_backend
+
+        def boom(path, *args, **kwargs):
+            raise OSError("no /proc here")
+
+        monkeypatch.setattr("builtins.open", boom)
+        monkeypatch.setattr("os.cpu_count", lambda: 8)
+        assert ollama_backend._default_thread_count() == 4
+
+    def test_tuning_reaches_the_wire(self):
+        from jarvis.llm.ollama_backend import OllamaBackend
+
+        backend = OllamaBackend(LLMConfig(num_threads=4, use_mmap=True))
+        options = backend._build_options(GenerationConfig())
+        assert options["num_thread"] == 4
+        assert options["use_mmap"] is True
+        # mlock is off unless asked for: on a tight machine it causes swapping.
+        assert "use_mlock" not in options
+
+    def test_mlock_is_opt_in(self):
+        from jarvis.llm.ollama_backend import OllamaBackend
+
+        backend = OllamaBackend(LLMConfig(use_mlock=True))
+        assert backend._build_options(GenerationConfig())["use_mlock"] is True
+
+    def test_an_explicit_thread_count_wins(self):
+        from jarvis.llm.ollama_backend import OllamaBackend
+
+        backend = OllamaBackend(LLMConfig(num_threads=2))
+        assert backend._build_options(GenerationConfig())["num_thread"] == 2
