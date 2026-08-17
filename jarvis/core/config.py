@@ -83,7 +83,26 @@ class LLMConfig:
     temperature: float = 0.7
     top_p: float = 0.9
     top_k: int = 40
-    context_tokens: int = 8192
+    # Context window. Two costs, and the second is the one that bites:
+    #   RAM  -- KV cache. Cheap on Qwen3.8: only 16 of its 64 layers are full
+    #           attention, so ~64 KB/token. 32k costs ~2.1 GB.
+    #   TIME -- PREFILL. Reading a prompt is compute-bound (matrix-matrix), not
+    #           bandwidth-bound like generation, and on 4 cores a 27B ingests
+    #           roughly 8-15 tok/s. A COLD 32k prompt is 35-70 minutes.
+    #
+    # Prefix caching is what makes a large window usable: llama.cpp reuses the
+    # KV of an unchanged prefix, so a long-lived session pays prefill ONCE and
+    # subsequent turns only ingest what changed. Set this high for deep work
+    # sessions; keep the conversation going rather than restarting it.
+    #
+    # 32768 suits real engineering work (a large source file plus history).
+    # Raise to 131072 for whole-repository or datasheet work and accept the
+    # first-turn cost. See docs/PERFORMANCE.md.
+    context_tokens: int = 32768
+    # Hard ceiling on what one tool result may contribute. Without this a
+    # single large file read silently blows the window and the server drops
+    # the top of the prompt -- losing the system prompt or the question.
+    max_tool_result_tokens: int = 8000
     # Ollama fallback settings
     ollama_host: str = "http://127.0.0.1:11434"
     ollama_model: str = "qwen3.8:27b"
@@ -127,6 +146,37 @@ class LLMConfig:
     # Spoken immediately, before the main model has finished. Keeps the
     # conversation alive instead of leaving dead air.
     voice_ack_enabled: bool = True
+
+    # -- CPU tuning --------------------------------------------------------- #
+    # Dense inference on a CPU is memory-bandwidth bound. 0 = use physical
+    # cores, which is what you want: hyperthreaded siblings share one memory
+    # port and contend for the exact resource that is already the bottleneck.
+    num_threads: int = 0
+    # Map weights from the page cache rather than copying them in. Leave on.
+    use_mmap: bool = True
+    # Pin weights in RAM. Only with headroom to spare -- on a tight machine
+    # this causes swapping, which is far slower than not pinning.
+    use_mlock: bool = False
+
+    # -- Speculative decoding (llama.cpp only) ------------------------------ #
+    # The one change that makes a dense 27B genuinely usable on this CPU. A
+    # small draft model proposes N tokens; the big model verifies all N in a
+    # SINGLE batched pass, so its 18 GB of weights are read once per round
+    # instead of once per token. Output is identical to running the big model
+    # alone -- rejected drafts are discarded -- so unlike dropping to Q2 this
+    # costs no quality at all.
+    #
+    # Roughly 2-3x on an i5-10210U: ~1.5 tok/s becomes ~3.3-4.8 depending on
+    # how often the draft agrees. Requires llama.cpp; Ollama does not expose
+    # --model-draft. See docs/PERFORMANCE.md.
+    draft_model: str = ""            # path to a small GGUF, or "" to disable
+    draft_tokens: int = 4            # proposals per round; >6 rarely pays
+    llamacpp_host: str = "http://127.0.0.1:8080/v1"
+
+    # -- Routing ------------------------------------------------------------ #
+    # When true the small model triages every turn and only wakes the big one
+    # for work that genuinely needs it. See jarvis.agent.router.
+    routing_enabled: bool = True
 
 
 @dataclass
