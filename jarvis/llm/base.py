@@ -170,6 +170,36 @@ def _msg_tokens(msg: Message) -> int:
     return estimate_tokens(msg.content) + 4
 
 
+#: Marker left in place of the elided middle of an oversized message. Visible
+#: on purpose: the model must know something was removed rather than silently
+#: reasoning about a fragment it believes is complete.
+#: Below this budget, eliding the middle of a message destroys more than
+#: it saves, so an oversized message is passed through intact instead.
+_MIN_TRUNCATION_BUDGET = 256
+
+ELISION_MARKER = "\n\n... [{dropped:,} characters elided from the middle] ...\n\n"
+
+
+def _truncate_message(msg: Message, max_tokens: int) -> Message:
+    """Shrink one oversized message, keeping its head and tail."""
+    budget_chars = max(200, (max_tokens - 4) * 4)
+    text = msg.content or ""
+    if len(text) <= budget_chars:
+        return msg
+    head = int(budget_chars * 0.6)
+    tail = max(0, budget_chars - head - 80)
+    dropped = len(text) - head - tail
+    body = text[:head] + ELISION_MARKER.format(dropped=dropped) + (
+        text[-tail:] if tail else ""
+    )
+    logger.warning(
+        "a single message of ~%d tokens exceeded the %d-token window; "
+        "elided %d characters from its middle",
+        estimate_tokens(text), max_tokens, dropped,
+    )
+    return Message(role=msg.role, content=body, metadata=dict(msg.metadata or {}))
+
+
 def trim_to_context(
     messages: Sequence[Message],
     max_tokens: int,
@@ -205,6 +235,26 @@ def trim_to_context(
         kept.append(body[last_user_idx])
     elif body:
         kept.append(body[-1])
+
+    # A single message larger than the whole window cannot be dropped -- it is
+    # the user's actual question, or the tool output they are asking about --
+    # so it is kept and truncated in the MIDDLE. Head and tail survive because
+    # that is where a file's structure and its conclusion live; cutting the
+    # tail alone loses the answer, and cutting the head loses the context.
+    #
+    # This is the difference between "your prompt was too long" and the server
+    # silently discarding the system prompt, which is what happens when an
+    # oversized transcript is sent unmodified.
+    # Only worth doing when there is a real budget to fit into. Below this a
+    # "window" is not a window, the caller is misconfigured, and mangling the
+    # user's actual question to satisfy it helps nobody -- pass it through and
+    # let the server complain.
+    if (
+        kept
+        and max_tokens >= _MIN_TRUNCATION_BUDGET
+        and _msg_tokens(kept[0]) > max_tokens
+    ):
+        kept[0] = _truncate_message(kept[0], max_tokens)
 
     def total(with_extras: List[Message]) -> int:
         extra = _msg_tokens(system_msg) if system_msg else 0
@@ -281,6 +331,30 @@ class BaseLLM(LLMBackend):
         """Real load work. Base does nothing so tests can use it."""
         return None
 
+    def _fit(self, messages: Sequence[Message]) -> List[Message]:
+        """Trim a transcript to the configured window before sending it.
+
+        Every backend calls this. Without it an oversized prompt is handed
+        straight to the server, which silently drops tokens off the front --
+        taking the system prompt with them. A truncation we perform is
+        visible, ordered and logged; one the server performs is none of those.
+        """
+        limit = int(getattr(self.cfg, "context_tokens", 0) or 0)
+        if limit <= 0:
+            return list(messages)
+        # Leave room for the reply: the window is shared between prompt and
+        # completion, and a prompt that exactly fills it leaves nothing to
+        # generate into.
+        reserve = int(getattr(self.cfg, "max_new_tokens", 512) or 512)
+        budget = max(256, limit - reserve)
+        fitted = trim_to_context(messages, budget)
+        if len(fitted) < len(messages):
+            logger.info(
+                "trimmed %d message(s) to fit a %d-token window",
+                len(messages) - len(fitted), limit,
+            )
+        return fitted
+
     def _gen_config(self, config: Optional[GenerationConfig]) -> GenerationConfig:
         """Merge caller-supplied :class:`GenerationConfig` with cfg defaults."""
         base = GenerationConfig(
@@ -338,6 +412,7 @@ __all__ = [
     "extract_thinking",
     "estimate_tokens",
     "trim_to_context",
+    "ELISION_MARKER",
     "apply_stop_strings",
     "BaseLLM",
 ]
