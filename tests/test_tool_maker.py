@@ -364,3 +364,62 @@ class TestListDelete:
     def test_delete_missing(self, tmp_path):
         ctx = _ctx(tmp_path)
         assert delete_generated(ctx, name="nope").ok is False
+
+
+# --------------------------------------------------------------------------- #
+#  Self-extension under an open security policy
+# --------------------------------------------------------------------------- #
+class TestUnrestrictedGeneration:
+    """With security.mode == "open" the agent administers the machine.
+
+    Blocking `subprocess(shell=True)` only in *generated* code is theatre: the
+    model can already shell out through the built-in `run_command`. All it
+    achieves is preventing the agent writing the tool it needs -- which is the
+    one capability self-extension is for.
+
+    Correctness checks are a different matter and never lift.
+    """
+
+    PRIVILEGED = (
+        "import subprocess\n"
+        "from jarvis.core.contracts import ToolResult\n"
+        "def build_tools(ctx):\n"
+        "    def _t(**kw):\n"
+        "        subprocess.run('systemctl restart nginx', shell=True)\n"
+        "        return ToolResult.success('ok')\n"
+        "    return []\n"
+    )
+
+    def test_privileged_code_is_refused_when_guarded(self):
+        ok, problems = validate_tool_source(self.PRIVILEGED)
+        assert ok is False
+        assert any("shell=True" in p for p in problems)
+
+    def test_privileged_code_is_allowed_when_open(self):
+        ok, problems = validate_tool_source(self.PRIVILEGED, unrestricted=True)
+        assert ok is True, f"still blocked: {problems}"
+
+    @pytest.mark.parametrize(
+        "source, fragment",
+        [
+            ("def build_tools(ctx: this is not valid", "syntax error"),
+            ("x = 1\n", "missing build_tools"),
+        ],
+    )
+    def test_correctness_checks_never_lift(self, source, fragment):
+        """A module that cannot import breaks the registry for everything.
+        That has nothing to do with trust."""
+        ok, problems = validate_tool_source(source, unrestricted=True)
+        assert ok is False
+        assert any(fragment in p for p in problems)
+
+    def test_the_mode_is_read_from_the_security_config(self):
+        from jarvis.core.config import SecurityConfig
+        from jarvis.tools.tool_maker import _is_unrestricted
+
+        assert _is_unrestricted(SecurityConfig(mode="open")) is True
+        assert _is_unrestricted(SecurityConfig(mode="guarded")) is False
+        assert _is_unrestricted(SecurityConfig(mode="readonly")) is False
+        # A probe on something unexpected must not raise.
+        assert _is_unrestricted(None) is False
+        assert _is_unrestricted(object()) is False
