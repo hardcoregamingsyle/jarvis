@@ -44,7 +44,28 @@ llm:
   temperature: 0.7
   top_p: 0.9
   top_k: 40
-  context_tokens: 8192       # also sent to Ollama as num_ctx
+  # Context window. Two costs, and the second is the one that bites:
+  #   RAM  -- KV cache. Cheap on Qwen3.8 (only 16 of 64 layers are full
+  #           attention): 32k costs ~2.1 GB.
+  #   TIME -- PREFILL, which is compute-bound, not bandwidth-bound. On 4 cores
+  #           a 27B ingests ~8-15 tok/s, so a COLD 32k prompt is 35-70 minutes.
+  #
+  # Prefix caching is what rescues this: llama.cpp reuses the KV of an
+  # unchanged prefix, so a long-lived session pays prefill ONCE and later
+  # turns ingest only what changed. Keep the session alive rather than
+  # restarting it between questions.
+  #
+  #    8192 -- voice conversation
+  #   32768 -- engineering work (the default): a large source file + history
+  #  131072 -- whole-repo or datasheet work; 2-5 hours cold, use a subagent
+  #  262144 -- the model's capability, not a runtime setting here: ~16.8 GB of
+  #            KV on top of 18 GB of weights does not fit in 32 GB.
+  context_tokens: 32768      # also sent to Ollama as num_ctx
+
+  # Hard cap on what ONE tool result may contribute. Reading a 40,000-line
+  # Verilog file is ordinary work; without this it evicts the system prompt
+  # and the question along with it.
+  max_tool_result_tokens: 8000
 
   # Install from https://ollama.com  (winget install Ollama.Ollama)
   ollama_host: http://127.0.0.1:11434
@@ -84,6 +105,37 @@ llm:
   # Speak a short holding line ("One moment, Sir") the instant a request is
   # understood, so the wait reads as deliberation rather than a crash.
   voice_ack_enabled: true
+
+  # -- CPU tuning -----------------------------------------------------------
+  # Dense inference on a CPU is memory-bandwidth bound. See docs/PERFORMANCE.md
+  # for the arithmetic; the short version is that these are worth 20-40%, not
+  # a multiple.
+  #
+  # 0 = physical cores. Do NOT set this to your logical-processor count: two
+  # hyperthreads on one core share a memory port and contend for the exact
+  # resource that is already the bottleneck.
+  num_threads: 0
+  use_mmap: true             # map weights from the page cache; leave on
+  use_mlock: false           # pin in RAM; only with headroom, else it swaps
+
+  # -- Speculative decoding (llama.cpp only) ---------------------------------
+  # The single largest speedup available on a bandwidth-bound CPU, and it
+  # costs NOTHING in quality: a small draft model proposes N tokens, the big
+  # model verifies all N in ONE batched pass, and rejected drafts are thrown
+  # away. Output is identical to running the big model alone.
+  #
+  # ~1.5 tok/s becomes ~3.3-4.8 on an i5-10210U depending on how often the
+  # draft agrees. Requires llama.cpp -- Ollama does not expose --model-draft.
+  # Run `jarvis serve-plan` for the exact command. See docs/PERFORMANCE.md.
+  draft_model: ""            # path to a small GGUF (e.g. qwen3-0.6b-q4_k_m)
+  draft_tokens: 4            # proposals per round; beyond ~6 rarely pays
+  llamacpp_host: http://127.0.0.1:8080/v1
+
+  # -- Routing ---------------------------------------------------------------
+  # The small model triages every turn: greetings, status questions and
+  # pause/resume are answered without waking the big model at all. Anything it
+  # cannot classify confidently escalates -- slow beats confidently wrong.
+  routing_enabled: true
 
   allow_fallback: true
   request_timeout: 600.0
