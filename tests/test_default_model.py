@@ -155,3 +155,70 @@ def test_a_full_config_still_builds_with_the_new_default():
     cfg = load_config(use_env=False)
     assert cfg.llm.model == DEFAULT_REPO
     assert isinstance(cfg, Config)
+
+
+# --------------------------------------------------------------------------- #
+#  No stale copy of the default may survive anywhere
+# --------------------------------------------------------------------------- #
+def test_no_module_hardcodes_a_superseded_ollama_tag():
+    """A literal fallback that drifts silently pulls the *previous* model.
+
+    `jarvis.runtime.ollama.model_tag` ends in a hardcoded tag for the case
+    where the catalogue cannot be read at all. When the default moved from
+    Qwen3.6 to Qwen3.8 that literal was left behind, so any machine hitting
+    the fallback quietly downloaded 18 GB of the wrong model. Pin it.
+    """
+    import re
+    from pathlib import Path as _Path
+
+    current = LLMConfig().ollama_model
+    package = _Path(__file__).resolve().parent.parent / "jarvis"
+
+    offenders = []
+    for path in package.rglob("*.py"):
+        if path.name == "models.py":
+            continue        # the catalogue legitimately names every model
+        for match in re.finditer(r'"(qwen[0-9.]*:[0-9a-zA-Z._-]+)"', path.read_text()):
+            tag = match.group(1)
+            # Only the 27B flagship tags are the "default" that can go stale;
+            # smaller tags are deliberate references to specific models.
+            if tag.endswith(":27b") and tag != current:
+                offenders.append(f"{path.relative_to(package.parent)}: {tag}")
+
+    assert not offenders, (
+        "these still name a superseded default instead of "
+        f"{current!r}: {offenders}"
+    )
+
+
+def test_the_installer_default_matches_the_catalogue():
+    """install.sh carries its own fallback tag; it must not drift either."""
+    import re
+
+    text = (ROOT / "install.sh").read_text(encoding="utf-8")
+    match = re.search(r'^FALLBACK_MAIN_TAG="([^"]+)"', text, re.M)
+    assert match, "install.sh no longer declares FALLBACK_MAIN_TAG"
+    assert match.group(1) == LLMConfig().ollama_model
+
+
+def test_the_installer_can_report_the_current_default():
+    """The upgrade warning depends on this action existing."""
+    text = (ROOT / "install.sh").read_text(encoding="utf-8")
+    assert '"default-tag": action_default_tag' in text
+    assert "def action_default_tag" in text
+    # It must read the catalogue rather than repeat the tag in shell.
+    assert "models.KNOWN_MODELS[models.DEFAULT_ALIAS].ollama_tag" in text
+
+
+def test_the_installer_warns_when_config_pins_an_older_model():
+    """Honouring config.yaml is right; doing it silently on an upgrade is not.
+
+    Without this the user runs ./install.sh expecting the new model, gets the
+    previous one, and is given no reason why.
+    """
+    text = (ROOT / "install.sh").read_text(encoding="utf-8")
+    assert 'DEFAULT_TAG="$(runtime_capture default-tag)"' in text
+    assert 'if [ -n "$DEFAULT_TAG" ] && [ "$MAIN_TAG" != "$DEFAULT_TAG" ]' in text
+    assert "./install.sh --model $DEFAULT_TAG" in text, (
+        "the warning must include the command that fixes it"
+    )
