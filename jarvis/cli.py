@@ -571,6 +571,86 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_serve_plan(args: argparse.Namespace) -> int:
+    """Print the llama-server command for this machine, with a draft model.
+
+    Speculative decoding is the single largest speedup available on a
+    bandwidth-bound CPU, and Ollama cannot do it -- it does not expose
+    ``--model-draft``. This prints the exact llama.cpp invocation, sized for
+    the cores and models actually present.
+    """
+    cfg = _load(args)
+    from .runtime import llamacpp
+
+    _out(BANNER)
+
+    models_dir = Path(args.models_dir) if args.models_dir else cfg.models_dir()
+    found = llamacpp.pick_target_and_draft(models_dir)
+    target = args.model or found["target"]
+    draft = args.draft or cfg.llm.draft_model or found["draft"]
+
+    if not target:
+        _out(f"No .gguf files found under {models_dir}.")
+        _out("")
+        _out("Fetch them with:")
+        _out("  huggingface-cli download Qwen/Qwen3.8-27B-GGUF \\")
+        _out(f"      qwen3.8-27b-q4_k_m.gguf --local-dir {models_dir}")
+        _out("  huggingface-cli download Qwen/Qwen3-0.6B-GGUF \\")
+        _out(f"      qwen3-0.6b-q4_k_m.gguf --local-dir {models_dir}")
+        return 1
+
+    plan = llamacpp.build_server_plan(
+        target,
+        draft_path=draft,
+        context=int(args.context or cfg.llm.context_tokens),
+        draft_tokens=int(args.draft_tokens or cfg.llm.draft_tokens),
+    )
+
+    if not llamacpp.is_available():
+        _out("llama-server is not on PATH. Build it with:")
+        _out("  git clone https://github.com/ggerganov/llama.cpp && cd llama.cpp")
+        _out("  cmake -B build -DGGML_NATIVE=ON && cmake --build build -j4")
+        _out("")
+
+    _out("Run this:\n")
+    _out(f"  {plan.command_line()}\n")
+
+    for note in plan.notes:
+        _out(f"  note: {note}")
+
+    if plan.uses_speculation:
+        try:
+            target_gb = Path(target).stat().st_size / 1e9
+            draft_gb = Path(draft).stat().st_size / 1e9
+        except OSError:
+            target_gb, draft_gb = 18.0, 0.4
+        _out("\n  Projected throughput (arithmetic, not measured):")
+        for acceptance in (0.6, 0.7, 0.8):
+            est = llamacpp.estimate_speedup(
+                target_gb=target_gb,
+                draft_gb=draft_gb,
+                acceptance=acceptance,
+                draft_tokens=plan.argv.count("--draft-max")
+                and int(plan.argv[plan.argv.index("--draft-max") + 1]),
+            )
+            _out(
+                f"    {acceptance:.0%} acceptance: "
+                f"{est['baseline_tok_s']} -> {est['speculative_tok_s']} tok/s "
+                f"({est['speedup']}x)"
+            )
+        _out("\n  Output is identical to running the large model alone;")
+        _out("  rejected drafts are discarded. Measure with `jarvis selftest`.")
+    else:
+        _out("\n  No draft model found: every token costs a full read of the")
+        _out("  large model. A 0.6B draft roughly doubles throughput.")
+
+    _out("\nThen point JARVIS at it in config.yaml:")
+    _out("  llm:")
+    _out("    backend: openai-compat")
+    _out(f"    vllm_host: {plan.base_url}")
+    return 0
+
+
 def cmd_ask(args: argparse.Namespace) -> int:
     """One question, one answer, then exit."""
     cfg = _load(args)
@@ -992,6 +1072,17 @@ def build_parser() -> argparse.ArgumentParser:
         "selftest",
         help="run the whole pipeline and report which stage is broken",
     ).set_defaults(func=cmd_selftest)
+
+    p_plan = sub.add_parser(
+        "serve-plan",
+        help="print the llama.cpp command that runs the big model fastest",
+    )
+    p_plan.add_argument("--model", help="path to the target .gguf")
+    p_plan.add_argument("--draft", help="path to a small draft .gguf")
+    p_plan.add_argument("--models-dir", help="where to look for .gguf files")
+    p_plan.add_argument("--context", type=int, help="context window")
+    p_plan.add_argument("--draft-tokens", type=int, help="proposals per round")
+    p_plan.set_defaults(func=cmd_serve_plan)
 
     p_ask = sub.add_parser("ask", help="ask one question and exit")
     p_ask.add_argument("text", help="the question")
