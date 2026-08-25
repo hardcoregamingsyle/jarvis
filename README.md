@@ -757,15 +757,19 @@ llm:
   model: Qwen/Qwen3-4B-Instruct-2507        # the router
   ollama_model: qwen3:4b-instruct-2507-q4_K_M
 
-  task_backend: openai-compat                # what spawn_task uses instead
-  task_base_url: http://<host>:8080/v1        # e.g. a llama.cpp llama-server
+  task_backend: openai-compat                 # what spawn_task uses instead
+  task_base_url: http://127.0.0.1:8080/v1     # this repo's own llama-server (run.sh)
 ```
 
-`task_base_url` can point anywhere an OpenAI-compatible server answers —
-including a separately hosted MoE far larger than would ever fit locally, or
-this same machine's Ollama running the dense 27B (`task_backend: ollama`,
-`task_ollama_model: qwen3.6:27b`) — since the router no longer has to be that
-model too. See `config.example.yaml` for the full worked example.
+Since this project lives inside MiniLLM (`jarvis/`, right next to `run.sh`
+and the model it serves), `task_base_url` pointing at `127.0.0.1:8080` is the
+common case now — start MiniLLM's `llama-server` once, point spawn_task at
+it, and the router and the model it delegates to share the machine and the
+repo. It can still point anywhere an OpenAI-compatible server answers,
+including a genuinely remote host, or this same machine's Ollama running the
+dense 27B (`task_backend: ollama`, `task_ollama_model: qwen3.6:27b`) — since
+the router no longer has to be that model too. See `config.example.yaml` for
+the full worked example.
 
 ---
 

@@ -156,12 +156,15 @@ llm:
   #   1. Change model/ollama_model above to the fast one:
   #        model: Qwen/Qwen3-4B-Instruct-2507
   #        ollama_model: qwen3:4b-instruct-2507-q4_K_M
-  #   2. Point spawn_task at the heavy one, e.g. a MiniLLM-hosted
-  #      llama-server on another machine serving Qwen3.8-27B:
+  #   2. Point spawn_task at the heavy one -- this project lives inside
+  #      MiniLLM now, so the common case is MiniLLM's OWN llama-server,
+  #      started once and reused, right next to this config:
   #        task_backend: openai-compat
-  #        task_base_url: http://<that machine>:8080/v1
-  #      — or the dense 27B via Ollama on this same host, i.e. what
-  #      model/ollama_model pointed at before step 1:
+  #        task_base_url: http://127.0.0.1:8080/v1
+  #      A genuinely separate machine works the same way, just with its
+  #      real host in place of 127.0.0.1. Or the dense 27B via Ollama on
+  #      this same host, i.e. what model/ollama_model pointed at before
+  #      step 1:
   #        task_backend: ollama
   #        task_ollama_model: qwen3.6:27b
   task_backend: ""
