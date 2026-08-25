@@ -74,13 +74,13 @@ of this: it still auto-selects from `AUTO_PROBE_ORDER` exactly as before this
 feature existed. `plan()` is consulted by `jarvis hardware` and by the
 installer to *report* a sensible starting point; it does not write to
 `llm.model` or `llm.backend` for you. Concretely: the shipped default remains
-`llm.model: Qwen/Qwen3.6-27B` regardless of what `jarvis hardware` recommends
+`llm.model: Qwen/Qwen3.8-27B` regardless of what `jarvis hardware` recommends
 for your machine — if the plan's recommendation looks better for your box, copy
 its `model (interactive)` / `model (background)` value into `llm.model` /
 `llm.ollama_model` yourself. (`jarvis.llm.models.recommend()`, which the planner
-calls, also does not know that `qwen3.6-27b` is the configured default — it
+calls, also does not know that `qwen3.8-27b` is the configured default — it
 ranks purely by size and purpose fit, which is why a 32 GB CPU-only plan
-recommends the MoE `qwen3-30b-a3b` over the dense `qwen3.6-27b` for the
+recommends the MoE `qwen3-30b-a3b` over the dense `qwen3.8-27b` for the
 background slot: 30.5B total parameters beats 27B on the ranking, MoE-ness
 aside. See [Worked example](#worked-example-32-gb-ram-and-8-gb-vram) and
 [docs/MODELS.md §2](MODELS.md#2-dense-vs-mixture-of-experts) for why that

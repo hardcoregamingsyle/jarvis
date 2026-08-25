@@ -138,6 +138,7 @@ class TransformersBackend(BaseLLM):
         self._ensure_pad_token()
         torch = self._torch
         gen = self._gen_config(config)
+        messages = self._fit(messages)
 
         prompt = self._build_prompt(messages)
         enc = self._tokenizer(prompt, return_tensors="pt")
@@ -185,6 +186,7 @@ class TransformersBackend(BaseLLM):
         self._ensure_pad_token()
         torch = self._torch
         gen = self._gen_config(config)
+        messages = self._fit(messages)
 
         try:
             from transformers import TextIteratorStreamer  # type: ignore

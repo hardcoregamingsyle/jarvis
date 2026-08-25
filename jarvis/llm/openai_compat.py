@@ -589,6 +589,7 @@ class OpenAICompatBackend(BaseLLM):
         """One non-streaming chat completion. Safe to call from many threads."""
         self.load()
         gen = self._gen_config(config)
+        messages = self._fit(messages)
         payload = self._payload(messages, gen, stream=False)
         url = self._url("/chat/completions")
 
@@ -648,6 +649,7 @@ class OpenAICompatBackend(BaseLLM):
         """
         self.load()
         gen = self._gen_config(config)
+        messages = self._fit(messages)
         payload = self._payload(messages, gen, stream=True)
         stops = tuple(gen.stop or ())
 

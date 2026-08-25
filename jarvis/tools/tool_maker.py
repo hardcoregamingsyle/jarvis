@@ -167,7 +167,33 @@ def _absolute_system_write(node: ast.Call) -> bool:
     return False
 
 
-def validate_tool_source(source: str) -> Tuple[bool, List[str]]:
+#: Checks that only make sense when the machine is being protected from the
+#: agent. Under ``security.mode == "open"`` -- the shipped default, meaning
+#: "this agent administers this box" -- they are exactly the capabilities the
+#: agent is supposed to have, and refusing them cripples self-extension: a tool
+#: that cannot shell out or touch /etc cannot administer anything.
+#:
+#: The syntax check and the ``build_tools`` check are NOT in this set. Those
+#: are correctness, not policy, and they always run: importing a module with a
+#: syntax error breaks the registry, and one without ``build_tools`` registers
+#: nothing. Neither has anything to do with trust.
+_POLICY_CHECKS = (
+    "banned import",
+    "banned call",
+    "subprocess called with shell=True",
+    "write to an absolute system path",
+)
+
+
+def _is_policy_problem(problem: str) -> bool:
+    return any(problem.startswith(prefix) for prefix in _POLICY_CHECKS)
+
+
+def validate_tool_source(
+    source: str,
+    *,
+    unrestricted: bool = False,
+) -> Tuple[bool, List[str]]:
     """Statically vet a generated tool module.
 
     Rejects on: syntax errors; missing ``build_tools``; dangerous builtins
@@ -219,6 +245,19 @@ def validate_tool_source(source: str) -> Tuple[bool, List[str]]:
     if not has_build_tools:
         problems.append("missing build_tools(ctx) function")
 
+    if unrestricted:
+        # Keep only the correctness failures; the policy ones describe powers
+        # this agent is meant to have. They are still logged, so an unexpected
+        # ctypes import in a generated tool is visible after the fact.
+        blocked = [p for p in problems if _is_policy_problem(p)]
+        if blocked:
+            log.info(
+                "tool source uses privileged operations (%s); allowed because "
+                "security.mode is open",
+                "; ".join(blocked),
+            )
+        problems = [p for p in problems if not _is_policy_problem(p)]
+
     ok = not problems
     return ok, problems
 
@@ -226,6 +265,24 @@ def validate_tool_source(source: str) -> Tuple[bool, List[str]]:
 # --------------------------------------------------------------------------- #
 #  Security-config resolution (duck-typed)
 # --------------------------------------------------------------------------- #
+def _is_unrestricted(security: Any) -> bool:
+    """True when the security policy is ``open``.
+
+    ``open`` is the shipped default and means "this agent administers this
+    machine". A tool it writes for itself should therefore be allowed the same
+    operations the agent may already perform through its built-in tools --
+    anything else is theatre: the model can shell out via ``run_command``
+    regardless, so blocking ``subprocess`` only in *generated* code stops
+    nothing and prevents the agent extending itself.
+    """
+    try:
+        cfg = getattr(security, "cfg", None) or security
+        mode = str(getattr(cfg, "mode", "") or "").strip().lower()
+        return mode == "open"
+    except Exception:  # noqa: BLE001 - a probe must never break tool creation
+        return False
+
+
 def _allow_network(security: Any) -> bool:
     """Extract ``allow_network`` from any of the shapes security may take."""
     try:
@@ -374,10 +431,12 @@ def make_tool(
         )
 
     # Duck-typed security probing must never raise.
+    security = getattr(ctx, "security", None)
     try:
-        _allow_network(getattr(ctx, "security", None))
+        _allow_network(security)
     except AttributeError:
         pass
+    unrestricted = _is_unrestricted(security)
 
     catalogue = ""
     registry = ctx.extra.get("registry") if hasattr(ctx, "extra") else None
@@ -404,7 +463,7 @@ def make_tool(
             if not drafted:
                 last_problems = ["LLM returned no code fence"]
                 continue
-            ok, problems = validate_tool_source(drafted)
+            ok, problems = validate_tool_source(drafted, unrestricted=unrestricted)
             if ok:
                 current_source = drafted
                 break
@@ -415,7 +474,9 @@ def make_tool(
                 f"{'; '.join(last_problems) or 'unknown'}"
             )
     else:
-        ok, problems = validate_tool_source(current_source)
+        ok, problems = validate_tool_source(
+            current_source, unrestricted=unrestricted
+        )
         if not ok:
             return ToolResult.failure(
                 f"provided source failed validation: {'; '.join(problems)}"

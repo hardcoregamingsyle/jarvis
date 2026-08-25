@@ -9,9 +9,9 @@
 > The one thing still checked for presence rather than freshness is the
 > **speech models**, and that is correct rather than a shortcut: Piper voices
 > and Whisper checkpoints are versioned *in their filenames*
-> (`en_GB-alan-medium`, `base.en`), so a file that is present is by definition
+> (`en_GB-alan-medium`, `small.en`), so a file that is present is by definition
 > the right one. Model weights are different — an Ollama tag like
-> `qwen3.6:27b` is a moving pointer, re-aimed upstream when the model is
+> `qwen3.8:27b` is a moving pointer, re-aimed upstream when the model is
 > re-quantised or fixed — which is why those are re-checked properly.
 
 ```bash
@@ -26,10 +26,10 @@ Nothing else is needed. The run ends with a summary like this:
     Repository         updated          a1b2c3d4..e5f6a7b8
     System libs        already current  all present
     Python packages    updated          lean profile, --upgrade
-    config.yaml        updated          llm.backend=ollama, llm.ollama_model=qwen3.6:27b
+    config.yaml        updated          llm.backend=ollama, llm.ollama_model=qwen3.8:27b
     Ollama runtime     already current  /home/hp/.local/share/jarvis/ollama
     Ollama server      already current  already listening
-    Main model         already current  qwen3.6:27b
+    Main model         already current  qwen3.8:27b
     Fast model         already current  qwen3:4b-instruct-2507-q4_K_M
     Speech assets      already current  voice + transcription
     Launcher           already current  /home/hp/.local/bin/jarvis
@@ -65,10 +65,10 @@ freshly downloaded Piper voice can be reported as `already current` (see
 | **Python packages** | **Yes** | `pip install --upgrade -e .` then `pip install --upgrade -r requirements.txt`. The `--upgrade` is the whole difference: without it pip is satisfied by whatever is already installed | `.venv/bin/pip install -U <package>` |
 | **Ollama itself** | **Yes**, when JARVIS installed it | `install_plan()` compares `ollama --version` against the latest GitHub release; `upgrade` downloads the new tarball and swaps the tree | `python -c "from jarvis.runtime import ollama; print(ollama.install(force=True))"` — but read the warning below first |
 | **Ollama, system-wide copy** | **No, by design** | A binary on `PATH` outside JARVIS's tree reports `action="external"`; it belongs to your package manager or to you | `sudo apt-get upgrade ollama`, or however you installed it |
-| **Model weights** | **Yes, on an update run** | `ensure_model(refresh=True)` re-issues the pull. Ollama compares digests and transfers only changed layers, so a current model costs a manifest. Reported as `updated` when bytes moved, `current` when none did | `ollama pull qwen3.6:27b`, or `./install.sh --no-update` to skip the check |
+| **Model weights** | **Yes, on an update run** | `ensure_model(refresh=True)` re-issues the pull. Ollama compares digests and transfers only changed layers, so a current model costs a manifest. Reported as `updated` when bytes moved, `current` when none did | `ollama pull qwen3.8:27b`, or `./install.sh --no-update` to skip the check |
 | **A model you added by hand** | **No** | The installer only ever touches `llm.ollama_model` and the small interactive tag | `ollama pull <tag>` |
 | **The Piper voice** | **No, presence only** | Both `en_GB-alan-medium.onnx` and `.onnx.json` present ⇒ nothing happens | `rm ~/.local/share/jarvis/voices/en_GB-alan-medium.onnx*` then re-run |
-| **The Whisper model** | **No, presence only** | A cache directory containing `model.bin`, `config.json` and `tokenizer.json` ⇒ nothing happens | `rm -rf ~/.cache/huggingface/hub/models--Systran--faster-whisper-base.en` then re-run |
+| **The Whisper model** | **No, presence only** | A cache directory containing `model.bin`, `config.json` and `tokenizer.json` ⇒ nothing happens | `rm -rf ~/.cache/huggingface/hub/models--Systran--faster-whisper-small.en` then re-run |
 | **`jarvis.service`** | **Yes, with `--service`** | `jarvis.linux.service.install()` rewrites the unit and runs `systemctl --user daemon-reload` | `./install.sh --service` |
 | **`jarvis-ollama.service`** | **Yes, with `--service`** | `install_service()` re-renders the unit from your config and rewrites `~/.config/systemd/user/jarvis-ollama.service` only when the text differs, then `daemon-reload` and `enable --now`. Edits you made by hand are overwritten — the unit's own header comment says so | `./install.sh --service` |
 | **`config.yaml`** | **Three keys only** | `llm.backend`, `llm.ollama_model`, and `llm.model` when `--model` names a Hugging Face repo. Edited line by line — comments, ordering and every other setting survive | `./install.sh --model <id>` |
@@ -244,12 +244,12 @@ the one where something is wrong.
     "managed": true,                    // false ⇒ a system-wide copy; not ours to update
     "runtime_dir": "/home/hp/.local/share/jarvis/ollama",
     "serving": true,
-    "model": "qwen3.6:27b",
+    "model": "qwen3.8:27b",
     "model_present": false,
     "models_cache_dir": "/home/hp/.ollama/models"
   },
   "voice": { "present": true,  "model_path": "…/voices/en_GB-alan-medium.onnx" },
-  "stt":   { "present": true,  "repo": "Systran/faster-whisper-base.en" },
+  "stt":   { "present": true,  "repo": "Systran/faster-whisper-small.en" },
   "espeak": { "present": false }        // advisory only; Piper is the default voice
 }
 ```
@@ -332,7 +332,7 @@ environment variable or edit the file.
 To reclaim the space:
 
 ```bash
-ollama rm qwen3.6:27b
+ollama rm qwen3.8:27b
 ```
 
 ### An older Ollama

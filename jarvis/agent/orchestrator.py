@@ -50,6 +50,7 @@ class Orchestrator:
         bus: Optional[EventBus] = None,
         task_manager: Optional[TaskManager] = None,
         task_llm: Optional[LLMBackend] = None,
+        voice_model: Any = None,
     ) -> None:
         self.config = config
         self.llm = llm
@@ -67,6 +68,18 @@ class Orchestrator:
         self._live_speech = bool(
             tts is not None and hasattr(tts, "feed") and hasattr(tts, "finish")
         )
+        # The small, fast model that phrases replies for speech. Optional: when
+        # absent the main model's own prose is spoken instead. Built lazily so
+        # constructing an Orchestrator never blocks on a second backend probe.
+        self._voice_model = voice_model
+        self._voice_model_ready = voice_model is not None
+
+        # Projects and durable task state. Built lazily and never fatal: a
+        # broken store must degrade to "no persistence", not "no assistant".
+        self._projects: Any = None
+        self._projects_ready = False
+        self._router: Any = None
+        self._router_ready = False
 
         # Tree limits are resource management, not permission: they stop one
         # mis-prompted agent turning into a fork bomb.  Read defensively because
@@ -131,6 +144,7 @@ class Orchestrator:
             user_title=self.config.agent.user_title,
             environment=self._env,
             tools_catalogue=catalogue,
+            extra=self._router_extra,
         )
 
     def _gen_config(self) -> GenerationConfig:
@@ -194,6 +208,21 @@ class Orchestrator:
             if on_chunk is not None:
                 on_chunk(piece)
 
+        # Triage first. Most turns -- greetings, "how's it going", "pause" --
+        # are answered from local state in a fraction of a second, and never
+        # wake the big model. Routing is advisory: anything it cannot classify
+        # confidently escalates, because slow is better than confidently wrong.
+        decision = self._route(user_input)
+        if decision is not None and not decision.needs_big_model:
+            reply = self._handle_light(decision, user_input)
+            if reply:
+                self.context.add_user(user_input)
+                self.context.add_assistant(reply)
+                self.bus.emit(Events.ASSISTANT_REPLY, reply)
+                if speak if speak is not None else self._speaking_enabled:
+                    self.say(reply, phrase=False)
+                return reply
+
         with self._lock:
             # Any finished background work is folded into this turn's context.
             reports = self._collect_reports()
@@ -214,6 +243,9 @@ class Orchestrator:
                 on_chunk=_on_chunk if (live or on_chunk is not None) else None,
                 bus=self.bus,
                 stream=stream or live,
+                tool_result_limit=getattr(
+                    self.config.llm, "max_tool_result_tokens", 8000
+                ),
             )
 
             reply = turn.text or "I'm afraid I have nothing useful to say to that."
@@ -229,15 +261,294 @@ class Orchestrator:
             # _on_chunk (the ordinary path) or was produced outside it (the
             # synthetic fallback answer, or the truncated-loop generate()) --
             # only the latter still needs to be handed to the speaker.
+            #
+            # Live speech deliberately skips the voice-model rephrasing pass
+            # below (`phrase=True`): that pass needs the complete answer
+            # before it can run, which is exactly the wait live speech exists
+            # to avoid. The big model's own prose is spoken as generated.
             if not turn.streamed:
                 self.tts.feed(reply)
             self.tts.finish()
         elif want_speech:
-            self.say(reply)
+            self.say(reply, phrase=True, user_input=user_input)
         return reply
 
-    def say(self, text: str) -> None:
-        """Speak a line, if a voice is configured.  Never raises."""
+    # ------------------------------------------------------------------ #
+    #  Projects and routing
+    # ------------------------------------------------------------------ #
+    @property
+    def projects(self) -> Any:
+        """The durable project/task store, or ``None`` if it cannot be opened."""
+        if not self._projects_ready:
+            self._projects_ready = True
+            try:
+                from .projects import ProjectStore
+
+                self._projects = ProjectStore(self.config.path("projects.db"))
+                # Anything still marked RUNNING belongs to a thread that did
+                # not survive the last shutdown. Say so honestly.
+                self._projects.mark_interrupted()
+            except Exception:  # noqa: BLE001 - persistence is not load-bearing
+                log.exception("project store unavailable; work will not persist")
+                self._projects = None
+        return self._projects
+
+    @property
+    def router(self) -> Any:
+        """Triage for incoming turns, or ``None`` when routing is disabled."""
+        if not self._router_ready:
+            self._router_ready = True
+            if not getattr(self.config.llm, "routing_enabled", True):
+                self._router = None
+            else:
+                try:
+                    from .router import Router
+
+                    self._router = Router(self.voice_model, task_manager=self.tasks)
+                except Exception:  # noqa: BLE001
+                    log.debug("router unavailable", exc_info=True)
+                    self._router = None
+        return self._router
+
+    def active_project(self) -> str:
+        store = self.projects
+        if store is None:
+            from .projects import DEFAULT_PROJECT
+
+            return DEFAULT_PROJECT
+        try:
+            return store.active_project()
+        except Exception:  # noqa: BLE001
+            log.debug("could not read the active project", exc_info=True)
+            return "general"
+
+    def handle_control(self, action: str, *, target: str = "") -> str:
+        """pause / resume / cancel, applied to the running tree and to disk.
+
+        Returns a spoken sentence. Never raises: "stop" has to work even when
+        parts of the system are already unwell.
+        """
+        from . import projects as P
+
+        store = self.projects
+        acted = 0
+
+        try:
+            live = [
+                t for t in self.tasks.list()
+                if t.state.value in ("running", "pending")
+            ]
+        except Exception:  # noqa: BLE001
+            live = []
+
+        targets = [t for t in live if not target or t.id == target]
+
+        if action in ("pause", "cancel"):
+            for task in targets:
+                try:
+                    self.tasks.cancel(task.id)
+                    acted += 1
+                except Exception:  # noqa: BLE001
+                    log.debug("could not stop %s", task.id, exc_info=True)
+                if store is not None:
+                    store.update_state(
+                        task.id, P.PAUSED if action == "pause" else P.CANCELLED
+                    )
+            if action == "pause":
+                return (
+                    f"Paused {acted} task{'s' if acted != 1 else ''}, "
+                    f"{self.config.agent.user_title}. "
+                    "Their progress is saved; say resume to carry on."
+                ) if acted else "Nothing was running to pause."
+            return (
+                f"Cancelled {acted} task{'s' if acted != 1 else ''}."
+                if acted else "Nothing was running to cancel."
+            )
+
+        if action == "resume":
+            if store is None:
+                return "I cannot resume: the project store is unavailable."
+            paused = [
+                t for t in store.resumable_tasks(project=store.active_project())
+                if t.state == P.PAUSED
+            ]
+            if not paused:
+                return "Nothing is on hold."
+            for task in paused:
+                try:
+                    # Re-dispatch with everything already learned, so it
+                    # continues rather than starting over.
+                    self.spawn_task(task.resume_briefing())
+                    store.update_state(task.id, P.RUNNING)
+                    acted += 1
+                except Exception:  # noqa: BLE001
+                    log.debug("could not resume %s", task.id, exc_info=True)
+            return (
+                f"Resumed {acted} task{'s' if acted != 1 else ''} "
+                "from where they left off."
+            )
+
+        if action == "status":
+            return self.status_line()
+
+        return f"I do not know how to {action}."
+
+    def status_line(self) -> str:
+        """What is running, in one spoken sentence."""
+        store = self.projects
+        if store is not None:
+            try:
+                return store.summary()
+            except Exception:  # noqa: BLE001
+                log.debug("project summary failed", exc_info=True)
+        try:
+            stats = self.tasks.stats()
+            running = stats.get("running", 0)
+            return (
+                f"{running} task{'s' if running != 1 else ''} running, "
+                f"{self.config.agent.user_title}."
+            )
+        except Exception:  # noqa: BLE001
+            return "I could not read the task list."
+
+    # ------------------------------------------------------------------ #
+    #  The voice model
+    # ------------------------------------------------------------------ #
+    @property
+    def voice_model(self) -> Any:
+        """The small model that phrases replies aloud, or ``None``.
+
+        Built on first use rather than in ``__init__`` so that constructing an
+        Orchestrator never pays for a second backend probe, and so a machine
+        with no small model available simply never builds one.
+        """
+        if not self._voice_model_ready:
+            self._voice_model_ready = True
+            try:
+                from ..llm.voice_model import create_voice_model
+
+                self._voice_model = create_voice_model(
+                    self.config.llm,
+                    agent_name=self.config.agent.name,
+                    user_title=self.config.agent.user_title,
+                )
+            except Exception:  # noqa: BLE001 - an optional layer, never fatal
+                log.debug("voice model unavailable", exc_info=True)
+                self._voice_model = None
+        return self._voice_model
+
+    def acknowledge(self) -> str:
+        """Speak a holding line while the main model thinks.
+
+        This is what stops a slow local model reading as a crash: the user
+        hears a reply within a fraction of a second, and the real answer
+        follows when it is ready. Returns the line spoken, or ``""``.
+        """
+        model = self.voice_model
+        if model is None:
+            return ""
+        try:
+            line = model.acknowledge()
+        except Exception:  # noqa: BLE001
+            log.debug("acknowledgement failed", exc_info=True)
+            return ""
+        if line:
+            self.say(line, phrase=False)
+        return line
+
+    def _route(self, user_input: str) -> Any:
+        """Classify a turn. ``None`` when routing is off or unavailable."""
+        router = self.router
+        if router is None:
+            return None
+        try:
+            decision = router.route(user_input)
+        except Exception:  # noqa: BLE001 - triage must never break a turn
+            log.debug("routing failed; escalating", exc_info=True)
+            return None
+        log.info(
+            "route=%s big=%s (%s)",
+            decision.route, decision.needs_big_model, decision.reason,
+        )
+        return decision
+
+    def _handle_light(self, decision: Any, user_input: str) -> str:
+        """Answer a turn that does not need the big model. "" to escalate."""
+        from .router import CHITCHAT, CONTROL, STATUS
+
+        if decision.route == CONTROL:
+            return self.handle_control(
+                decision.action, target=decision.target_task_id
+            )
+
+        if decision.route == STATUS:
+            # Read the real task tree aloud rather than asking a 1.7B model
+            # what it imagines is happening.
+            line = self.status_line()
+            model = self.voice_model
+            if model is not None:
+                try:
+                    return model.speakable(line, user_input=user_input) or line
+                except Exception:  # noqa: BLE001
+                    log.debug("status phrasing failed", exc_info=True)
+            return line
+
+        if decision.route == CHITCHAT:
+            model = self.voice_model
+            if model is None:
+                # Without a small model there is nothing cheap to answer with,
+                # so let the big one handle it rather than inventing a reply.
+                return ""
+            try:
+                from ..core.contracts import GenerationConfig, Message
+
+                result = model.backend.generate(
+                    [
+                        Message.system(
+                            f"You are {self.config.agent.name}, a British AI "
+                            f"assistant. Reply to this in ONE short spoken "
+                            f"sentence. Address the user as "
+                            f"{self.config.agent.user_title}."
+                        ),
+                        Message.user(user_input),
+                    ],
+                    GenerationConfig(max_new_tokens=60, temperature=0.6),
+                )
+                from ..llm.voice_model import strip_markup
+
+                return strip_markup(getattr(result, "text", "") or "")
+            except Exception:  # noqa: BLE001
+                log.debug("chitchat reply failed; escalating", exc_info=True)
+                return ""
+
+        return ""
+
+    def say(self, text: str, *, phrase: bool = False, user_input: str = "") -> None:
+        """Speak a line, if a voice is configured.  Never raises.
+
+        With ``phrase=True`` the text is first handed to the voice model to be
+        rendered as spoken prose; that path is used for real answers, not for
+        acknowledgements and greetings which are already speech-shaped.
+        """
+        if not text:
+            return
+
+        if phrase:
+            model = self.voice_model
+            if model is not None:
+                try:
+                    text = model.speakable(text, user_input=user_input) or text
+                except Exception:  # noqa: BLE001 - fall back to the raw answer
+                    log.debug("voice-model phrasing failed", exc_info=True)
+            else:
+                # No voice model: still strip markdown, which is never spoken.
+                try:
+                    from ..llm.voice_model import strip_markup
+
+                    text = strip_markup(text) or text
+                except Exception:  # noqa: BLE001
+                    log.debug("markup stripping failed", exc_info=True)
+
         if not text:
             return
         self.bus.emit(Events.SPEAK, text)
@@ -297,13 +608,32 @@ class Orchestrator:
             parent_id=parent_id,
             max_depth=self.max_agent_depth,
         )
-        return self.tasks.spawn(
+        task = self.tasks.spawn(
             goal,
             sub.run,
             timeout=self.config.agent.subagent_timeout,
             metadata={"context": context},
             parent_id=parent_id,
         )
+
+        # Mirror it to disk. The in-memory tree schedules; this is what
+        # survives a reboot and makes pause/resume mean anything.
+        store = self.projects
+        if store is not None:
+            try:
+                from . import projects as P
+
+                store.record_task(
+                    task.id,
+                    goal,
+                    state=P.RUNNING,
+                    parent_id=parent_id or "",
+                    depth=depth,
+                    metadata={"context": context},
+                )
+            except Exception:  # noqa: BLE001 - persistence is never fatal
+                log.debug("could not persist task %s", task.id, exc_info=True)
+        return task
 
     def task_tree(self, root_id: Optional[str] = None) -> str:
         """A compact rendering of the whole task tree, suitable to read aloud."""
@@ -523,9 +853,64 @@ class Orchestrator:
                 for h in hits
             ]
 
+        # -- projects and durable state ---------------------------------- #
+        def create_project(name: str, description: str = "") -> dict:
+            """Create a project: a named container for a set of related tasks.
+
+            Use one per distinct body of work. Tasks are filed under whichever
+            project is active, so status and pause/resume have an unambiguous
+            subject instead of one global pile.
+            """
+            store = self.projects
+            if store is None:
+                return {"error": "the project store is unavailable"}
+            project = store.create_project(name, description=description)
+            return {"created": True, "project": project.to_dict()}
+
+        def switch_project(name: str) -> dict:
+            """Make a project active. New tasks are filed under it."""
+            store = self.projects
+            if store is None:
+                return {"error": "the project store is unavailable"}
+            return {"active": store.set_active_project(name)}
+
+        def list_projects() -> list:
+            """Every project, with the active one first."""
+            store = self.projects
+            if store is None:
+                return [{"error": "the project store is unavailable"}]
+            return [p.to_dict() for p in store.list_projects()]
+
+        def pause_work(task_id: str = "") -> dict:
+            """Put work on hold so it survives a reboot.
+
+            Progress notes are written to disk; `resume_work` re-dispatches a
+            subagent primed with them, so it continues rather than restarting.
+            Omit task_id to pause everything running.
+            """
+            return {"message": self.handle_control("pause", target=task_id)}
+
+        def resume_work() -> dict:
+            """Restart paused work from where it left off."""
+            return {"message": self.handle_control("resume")}
+
+        def record_progress(task_id: str, note: str) -> dict:
+            """Record what a task has achieved so far.
+
+            This is what makes resuming meaningful: without notes a resumed
+            task starts from nothing. Call it as milestones are reached, not
+            at the end.
+            """
+            store = self.projects
+            if store is None:
+                return {"error": "the project store is unavailable"}
+            return {"recorded": bool(store.add_progress(task_id, note))}
+
         for fn in (
             spawn_task, task_tree, list_tasks, task_status, cancel_task,
             remember, recall,
+            create_project, switch_project, list_projects,
+            pause_work, resume_work, record_progress,
         ):
             try:
                 register(fn, dangerous=False)

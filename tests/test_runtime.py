@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
-from jarvis.core.config import load_config
+from jarvis.core.config import LLMConfig, STTConfig, load_config
 from jarvis.runtime import assets, ollama
 from jarvis.runtime import status as runtime_status
 
@@ -924,7 +924,7 @@ def tags_response(*names: str, size: int = 16_100_000_000) -> FakeResponse:
 
 
 def test_model_tag_comes_from_the_config(cfg):
-    assert ollama.model_tag(cfg) == "qwen3.6:27b"
+    assert ollama.model_tag(cfg) == LLMConfig().ollama_model
     cfg.llm.ollama_model = "qwen3:4b-instruct-2507-q4_K_M"
     assert ollama.model_tag(cfg) == "qwen3:4b-instruct-2507-q4_K_M"
 
@@ -1130,12 +1130,14 @@ def test_ensure_model_pulls_once_and_is_a_no_op_the_second_time(cfg, monkeypatch
     first = ollama.ensure_model(cfg)
     assert first["ok"] is True
     assert first["action"] == "pulled"
-    assert daemon.pulls == ["qwen3.6:27b"]
+    assert daemon.pulls == [LLMConfig().ollama_model]
 
     second = ollama.ensure_model(cfg)
     assert second["ok"] is True
     assert second["action"] == "present"
-    assert daemon.pulls == ["qwen3.6:27b"], "the model must not be pulled twice"
+    assert daemon.pulls == [LLMConfig().ollama_model], (
+        "the model must not be pulled twice"
+    )
 
 
 def test_ensure_model_does_not_pull_when_space_is_short(cfg, monkeypatch):
@@ -1375,7 +1377,13 @@ def test_whisper_repo_candidates_expand_a_size_alias():
     assert assets.whisper_repo_candidates("") == []
 
 
-def _seed_whisper_cache(root: Path, repo: str = "Systran/faster-whisper-base.en") -> Path:
+#: The STT model the shipped config actually asks for. Derived rather than
+#: written down, so changing STTConfig.model does not silently rot these tests.
+DEFAULT_STT_MODEL = STTConfig().model
+DEFAULT_STT_REPO = f"Systran/faster-whisper{DEFAULT_STT_MODEL and '-' + DEFAULT_STT_MODEL}"
+
+
+def _seed_whisper_cache(root: Path, repo: str = DEFAULT_STT_REPO) -> Path:
     snapshot = root / ("models--" + repo.replace("/", "--")) / "snapshots" / "abc123"
     snapshot.mkdir(parents=True)
     for name in ("model.bin", "config.json", "tokenizer.json"):
@@ -1392,15 +1400,15 @@ def test_whisper_model_status_finds_a_cached_model(cfg, tmp_path, monkeypatch):
     result = assets.whisper_model_status(cfg)
 
     assert result["present"] is True
-    assert result["model"] == "base.en"
-    assert result["repo"] == "Systran/faster-whisper-base.en"
+    assert result["model"] == DEFAULT_STT_MODEL
+    assert result["repo"] == DEFAULT_STT_REPO
     assert result["size_bytes"] == 3000
 
 
 def test_whisper_model_status_rejects_an_interrupted_download(cfg, tmp_path, monkeypatch):
     """A directory missing model.bin is not a usable model, however present it looks."""
     cache = tmp_path / "hf-cache"
-    snapshot = cache / "models--Systran--faster-whisper-base.en" / "snapshots" / "abc"
+    snapshot = cache / ("models--" + DEFAULT_STT_REPO.replace("/", "--")) / "snapshots" / "abc"
     snapshot.mkdir(parents=True)
     (snapshot / "config.json").write_bytes(b"{}")
     monkeypatch.setattr(assets, "_hf_cache_dir", lambda: cache)
@@ -1409,7 +1417,10 @@ def test_whisper_model_status_rejects_an_interrupted_download(cfg, tmp_path, mon
 
     assert result["present"] is False
     assert "not cached" in result["reason"]
-    assert "150 MB" in result["reason"], "the size must be quoted before the download"
+    expected_mb = int(assets._WHISPER_SIZE_GB[DEFAULT_STT_MODEL] * 1000)
+    assert f"{expected_mb} MB" in result["reason"], (
+        "the size must be quoted before the download"
+    )
 
 
 def test_ensure_whisper_model_says_so_cleanly_when_faster_whisper_is_absent(
@@ -1448,7 +1459,9 @@ def test_ensure_whisper_model_prefetches_through_the_library(cfg, tmp_path, monk
 
     assert result["ok"] is True
     assert result["action"] == "fetched"
-    assert built == [{"name": "base.en", "device": "cpu", "compute_type": "int8"}]
+    assert built == [
+        {"name": DEFAULT_STT_MODEL, "device": "cpu", "compute_type": "int8"}
+    ]
 
     # Second run: already cached, so the library is never touched again.
     again = assets.ensure_whisper_model(cfg)
@@ -1599,7 +1612,7 @@ def test_status_gives_the_whole_picture_without_side_effects(cfg, tmp_path, monk
     assert set(result["missing"]) == {"ollama", "model", "voice", "stt"}
     assert result["ollama"]["installed"] is False
     assert result["ollama"]["serving"] is False
-    assert result["ollama"]["model"] == "qwen3.6:27b"
+    assert result["ollama"]["model"] == LLMConfig().ollama_model
     assert result["espeak"]["present"] is False
     assert "disk" in result
     # voices_dir() is created on access by Config; nothing else may appear.
@@ -1609,7 +1622,7 @@ def test_status_gives_the_whole_picture_without_side_effects(cfg, tmp_path, monk
 def test_status_reports_ready_when_everything_is_in_place(cfg, tmp_path, monkeypatch):
     _install_managed(cfg, "0.9.9")
     _report_version(monkeypatch, "0.9.9")
-    route(monkeypatch, {"/api/tags": lambda r: tags_response("qwen3.6:27b")})
+    route(monkeypatch, {"/api/tags": lambda r: tags_response(LLMConfig().ollama_model)})
 
     voices = Path(cfg.voices_dir())
     (voices / "en_GB-alan-medium.onnx").write_bytes(b"x" * 16)

@@ -25,8 +25,9 @@ import secrets
 import socket
 import sys
 import textwrap
+import time
 from pathlib import Path
-from typing import Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 from .core.config import Config, load_config
 from .core.logging_setup import setup_logging
@@ -342,6 +343,311 @@ def cmd_say(args: argparse.Namespace) -> int:
         _out(f"Wrote {len(data)} bytes to {target}")
     else:
         engine.speak(text)
+    return 0
+
+
+def cmd_selftest(args: argparse.Namespace) -> int:
+    """Exercise the whole pipeline stage by stage and report where it breaks.
+
+    ``jarvis doctor`` answers "what is installed". This answers the question
+    that actually matters when the thing is misbehaving: "which link in the
+    chain is broken". Each stage is run for real, in order, and a failure in
+    one does not prevent the rest from being reported -- knowing that STT and
+    TTS both work while the LLM is silent is far more useful than stopping at
+    the first problem.
+    """
+    cfg = _load(args)
+    _out(BANNER)
+    _out("Running the pipeline end to end.\n")
+
+    failures: List[str] = []
+    warnings: List[str] = []
+
+    def stage(name: str, ok: Optional[bool], detail: str = "") -> None:
+        mark = {True: "OK  ", False: "FAIL", None: "WARN"}[ok]
+        _out(f"  {mark}  {name:<28} {detail}")
+        if ok is False:
+            failures.append(name)
+        elif ok is None:
+            warnings.append(name)
+
+    # -- 1. Hardware ------------------------------------------------------- #
+    _out("Hardware")
+    try:
+        from .core import hardware
+
+        profile = hardware.detect()
+        stage(
+            "CPU",
+            True,
+            f"{profile.cpu_cores} cores / {profile.cpu_threads} threads, "
+            f"{profile.ram_gb:.1f} GB RAM",
+        )
+        if profile.accelerator == "none":
+            stage(
+                "Accelerator",
+                None,
+                f"none usable{' (' + profile.gpu_name + ')' if profile.gpu_name else ''}"
+                " - running on CPU",
+            )
+        else:
+            stage("Accelerator", True, f"{profile.accelerator} ({profile.gpu_name})")
+    except Exception as exc:  # noqa: BLE001
+        stage("Hardware detection", False, str(exc))
+
+    # -- 2. The language model --------------------------------------------- #
+    _out("\nLanguage model")
+    llm = None
+    try:
+        from .llm import create_llm
+
+        llm = create_llm(cfg.llm)
+        name = getattr(llm, "name", "?")
+        if name == "stub":
+            stage(
+                "Backend",
+                False,
+                "no real backend reachable - is `ollama serve` running?",
+            )
+        else:
+            stage("Backend", True, f"{name} ({cfg.llm.model})")
+    except Exception as exc:  # noqa: BLE001
+        stage("Backend", False, str(exc))
+
+    if llm is not None and getattr(llm, "name", "") != "stub":
+        try:
+            from .core.contracts import GenerationConfig, Message
+
+            started = time.monotonic()
+            result = llm.generate(
+                [
+                    Message.system("Reply with exactly one short sentence."),
+                    Message.user("Say 'systems nominal' and nothing else."),
+                ],
+                GenerationConfig(max_new_tokens=64, temperature=0.1),
+            )
+            elapsed = time.monotonic() - started
+            text = (result.text or "").strip()
+            if not text:
+                stage(
+                    "Generation",
+                    False,
+                    f"the model returned NOTHING after {elapsed:.1f}s - this is "
+                    "the classic thinking-mode failure; check llm.thinking",
+                )
+            else:
+                rate = ""
+                if result.completion_tokens and elapsed > 0:
+                    rate = f", ~{result.completion_tokens / elapsed:.1f} tok/s"
+                stage("Generation", True, f"{elapsed:.1f}s{rate}: {text[:60]!r}")
+                if elapsed > 30:
+                    stage(
+                        "Generation speed",
+                        None,
+                        "very slow for interactive use - the voice model below "
+                        "is what keeps replies feeling immediate",
+                    )
+        except Exception as exc:  # noqa: BLE001
+            stage("Generation", False, f"{type(exc).__name__}: {exc}")
+
+    # -- 3. The voice model ------------------------------------------------- #
+    try:
+        from .llm.voice_model import create_voice_model
+
+        voice_model = create_voice_model(
+            cfg.llm,
+            agent_name=cfg.agent.name,
+            user_title=cfg.agent.user_title,
+        )
+        if voice_model is None:
+            if cfg.llm.voice_model_enabled and cfg.llm.voice_model:
+                stage(
+                    "Voice model",
+                    None,
+                    f"{cfg.llm.voice_model} not available - the main model will "
+                    f"speak for itself (slower). `ollama pull {cfg.llm.voice_model}`",
+                )
+            else:
+                stage("Voice model", None, "disabled in the configuration")
+        else:
+            started = time.monotonic()
+            spoken = voice_model.speakable("16:30", user_input="what time is it")
+            stage(
+                "Voice model",
+                bool(spoken),
+                f"{time.monotonic() - started:.1f}s: {spoken[:60]!r}",
+            )
+    except Exception as exc:  # noqa: BLE001
+        stage("Voice model", False, f"{type(exc).__name__}: {exc}")
+
+    # -- 4. Speech to text --------------------------------------------------- #
+    _out("\nSpeech")
+    try:
+        from .speech import create_stt
+
+        stt = create_stt(cfg.stt)
+        name = getattr(stt, "name", "?")
+        if name == "null":
+            stage("Speech to text", False, "no engine - `pip install faster-whisper`")
+        else:
+            stage("Speech to text", True, f"{name} ({cfg.stt.model})")
+    except Exception as exc:  # noqa: BLE001
+        stage("Speech to text", False, str(exc))
+
+    try:
+        from .speech.audio_io import AudioRecorder
+
+        recorder = AudioRecorder(cfg.stt)
+        if recorder.is_available():
+            devices = [
+                d for d in recorder.list_devices()
+                if int(d.get("max_input_channels", 0) or 0) > 0
+            ]
+            stage("Microphone", bool(devices), f"{len(devices)} input device(s)")
+        else:
+            stage("Microphone", False, "no audio backend - `pip install sounddevice`")
+    except Exception as exc:  # noqa: BLE001
+        stage("Microphone", False, str(exc))
+
+    # -- 5. Text to speech --------------------------------------------------- #
+    try:
+        from .speech.tts import create_tts
+
+        engine = create_tts(cfg.tts, voices_dir=cfg.voices_dir())
+        name = getattr(engine, "name", "?")
+        if name == "null":
+            stage(
+                "Text to speech",
+                False,
+                "no engine - `pip install piper-tts` or install espeak-ng",
+            )
+        else:
+            started = time.monotonic()
+            audio = engine.synthesize("Systems nominal.")
+            elapsed = time.monotonic() - started
+            stage(
+                "Text to speech",
+                bool(audio),
+                f"{name}, {len(audio)} bytes in {elapsed:.1f}s"
+                if audio
+                else f"{name} produced no audio",
+            )
+    except Exception as exc:  # noqa: BLE001
+        stage("Text to speech", False, str(exc))
+
+    # -- 6. A full turn ------------------------------------------------------ #
+    _out("\nFull turn")
+    try:
+        from . import app as app_module
+
+        subsystems = app_module.build(cfg, configure_logging=False)
+        try:
+            agent = subsystems.orchestrator
+            if agent is None:
+                stage("Orchestrator", False, "could not be built")
+            else:
+                started = time.monotonic()
+                reply = agent.chat("Say 'systems nominal' and nothing else.", speak=False)
+                elapsed = time.monotonic() - started
+                if not (reply or "").strip():
+                    stage("Agent turn", False, "the agent produced an empty reply")
+                else:
+                    stage("Agent turn", True, f"{elapsed:.1f}s: {reply[:60]!r}")
+        finally:
+            app_module.shutdown(subsystems)
+    except Exception as exc:  # noqa: BLE001
+        stage("Agent turn", False, f"{type(exc).__name__}: {exc}")
+
+    # -- Verdict -------------------------------------------------------------- #
+    _out("")
+    if failures:
+        _out(f"{len(failures)} stage(s) failed: {', '.join(failures)}")
+        _out("Run 'jarvis doctor' for the matching install commands.")
+        return 1
+    if warnings:
+        _out(f"Everything works. {len(warnings)} note(s): {', '.join(warnings)}")
+        return 0
+    _out("Everything works.")
+    return 0
+
+
+def cmd_serve_plan(args: argparse.Namespace) -> int:
+    """Print the llama-server command for this machine, with a draft model.
+
+    Speculative decoding is the single largest speedup available on a
+    bandwidth-bound CPU, and Ollama cannot do it -- it does not expose
+    ``--model-draft``. This prints the exact llama.cpp invocation, sized for
+    the cores and models actually present.
+    """
+    cfg = _load(args)
+    from .runtime import llamacpp
+
+    _out(BANNER)
+
+    models_dir = Path(args.models_dir) if args.models_dir else cfg.models_dir()
+    found = llamacpp.pick_target_and_draft(models_dir)
+    target = args.model or found["target"]
+    draft = args.draft or cfg.llm.draft_model or found["draft"]
+
+    if not target:
+        _out(f"No .gguf files found under {models_dir}.")
+        _out("")
+        _out("Fetch them with:")
+        _out("  huggingface-cli download Qwen/Qwen3.8-27B-GGUF \\")
+        _out(f"      qwen3.8-27b-q4_k_m.gguf --local-dir {models_dir}")
+        _out("  huggingface-cli download Qwen/Qwen3-0.6B-GGUF \\")
+        _out(f"      qwen3-0.6b-q4_k_m.gguf --local-dir {models_dir}")
+        return 1
+
+    plan = llamacpp.build_server_plan(
+        target,
+        draft_path=draft,
+        context=int(args.context or cfg.llm.context_tokens),
+        draft_tokens=int(args.draft_tokens or cfg.llm.draft_tokens),
+    )
+
+    if not llamacpp.is_available():
+        _out("llama-server is not on PATH. Build it with:")
+        _out("  git clone https://github.com/ggerganov/llama.cpp && cd llama.cpp")
+        _out("  cmake -B build -DGGML_NATIVE=ON && cmake --build build -j4")
+        _out("")
+
+    _out("Run this:\n")
+    _out(f"  {plan.command_line()}\n")
+
+    for note in plan.notes:
+        _out(f"  note: {note}")
+
+    if plan.uses_speculation:
+        try:
+            target_gb = Path(target).stat().st_size / 1e9
+            draft_gb = Path(draft).stat().st_size / 1e9
+        except OSError:
+            target_gb, draft_gb = 18.0, 0.4
+        _out("\n  Projected throughput (arithmetic, not measured):")
+        for acceptance in (0.6, 0.7, 0.8):
+            est = llamacpp.estimate_speedup(
+                target_gb=target_gb,
+                draft_gb=draft_gb,
+                acceptance=acceptance,
+                draft_tokens=plan.argv.count("--draft-max")
+                and int(plan.argv[plan.argv.index("--draft-max") + 1]),
+            )
+            _out(
+                f"    {acceptance:.0%} acceptance: "
+                f"{est['baseline_tok_s']} -> {est['speculative_tok_s']} tok/s "
+                f"({est['speedup']}x)"
+            )
+        _out("\n  Output is identical to running the large model alone;")
+        _out("  rejected drafts are discarded. Measure with `jarvis selftest`.")
+    else:
+        _out("\n  No draft model found: every token costs a full read of the")
+        _out("  large model. A 0.6B draft roughly doubles throughput.")
+
+    _out("\nThen point JARVIS at it in config.yaml:")
+    _out("  llm:")
+    _out("    backend: openai-compat")
+    _out(f"    vllm_host: {plan.base_url}")
     return 0
 
 
@@ -762,6 +1068,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="detect CPU/GPU/accelerator and show the model/backend plan",
     ).set_defaults(func=cmd_hardware)
     sub.add_parser("tools", help="list registered tools").set_defaults(func=cmd_tools)
+    sub.add_parser(
+        "selftest",
+        help="run the whole pipeline and report which stage is broken",
+    ).set_defaults(func=cmd_selftest)
+
+    p_plan = sub.add_parser(
+        "serve-plan",
+        help="print the llama.cpp command that runs the big model fastest",
+    )
+    p_plan.add_argument("--model", help="path to the target .gguf")
+    p_plan.add_argument("--draft", help="path to a small draft .gguf")
+    p_plan.add_argument("--models-dir", help="where to look for .gguf files")
+    p_plan.add_argument("--context", type=int, help="context window")
+    p_plan.add_argument("--draft-tokens", type=int, help="proposals per round")
+    p_plan.set_defaults(func=cmd_serve_plan)
 
     p_ask = sub.add_parser("ask", help="ask one question and exit")
     p_ask.add_argument("text", help="the question")

@@ -15,12 +15,49 @@ from urllib import request as _urlrequest
 
 from ..core.contracts import GenerationConfig, LLMResult, Message
 from ..core.config import LLMConfig
-from .base import BaseLLM, apply_stop_strings, strip_thinking
+from .base import (
+    BaseLLM,
+    apply_stop_strings,
+    salvage_thinking,
+    strip_thinking,
+    wants_thinking_disabled,
+)
 
 
 logger = logging.getLogger(__name__)
 
 _PROBE_TIMEOUT = 1.5
+
+
+def _default_thread_count() -> int:
+    """Physical cores, which is what a bandwidth-bound workload wants.
+
+    Hyperthreading does not help here: two threads on one physical core share
+    a single memory port, so the pair contends for the exact resource that is
+    already the bottleneck. On a 4-core/8-thread i5 the right answer is 4, and
+    Ollama's own default of "all logical processors" is measurably worse.
+    """
+    try:
+        import os
+
+        physical = 0
+        try:
+            with open("/proc/cpuinfo", "r", encoding="utf-8", errors="replace") as fh:
+                ids = {
+                    line.split(":", 1)[1].strip()
+                    for line in fh
+                    if line.lower().startswith("core id")
+                }
+            physical = len(ids)
+        except OSError:
+            physical = 0
+        if physical > 0:
+            return physical
+        logical = os.cpu_count() or 0
+        # No topology available: assume SMT and halve, floor of 1.
+        return max(1, logical // 2) if logical > 1 else 1
+    except Exception:  # noqa: BLE001 - a tuning hint must never break a call
+        return 0
 
 
 class OllamaBackend(BaseLLM):
@@ -33,6 +70,10 @@ class OllamaBackend(BaseLLM):
         self._host = (cfg.ollama_host or "http://127.0.0.1:11434").rstrip("/")
         self._model = cfg.ollama_model or cfg.model
         self._timeout = float(cfg.request_timeout or 600.0)
+        # None = leave the model's own default alone; False = explicitly off.
+        self._think: Optional[bool] = (
+            False if wants_thinking_disabled(self._model) else None
+        )
 
     # -- HTTP helpers ------------------------------------------------------- #
     def _url(self, path: str) -> str:
@@ -77,6 +118,26 @@ class OllamaBackend(BaseLLM):
             "top_p": float(gen.top_p),
             "top_k": int(gen.top_k),
         }
+
+        # -- CPU tuning ----------------------------------------------------- #
+        # Dense CPU inference is memory-bandwidth bound, not compute bound, and
+        # these three settings are the difference between using the machine and
+        # fighting it.
+        threads = int(getattr(self.cfg, "num_threads", 0) or 0)
+        if threads <= 0:
+            threads = _default_thread_count()
+        if threads > 0:
+            options["num_thread"] = threads
+
+        if getattr(self.cfg, "use_mmap", True):
+            # Weights are mapped from the page cache instead of copied into the
+            # process, so a second run starts warm rather than re-reading GB
+            # from disk.
+            options["use_mmap"] = True
+        if getattr(self.cfg, "use_mlock", False):
+            # Pins weights in RAM. Only worth it with headroom to spare; on a
+            # tight machine it triggers swapping, which is far worse.
+            options["use_mlock"] = True
         if gen.stop:
             options["stop"] = list(gen.stop)
         if gen.seed is not None:
@@ -84,12 +145,20 @@ class OllamaBackend(BaseLLM):
         return options
 
     def _payload(self, messages: Sequence[Message], gen: GenerationConfig, *, stream: bool) -> dict:
-        return {
+        payload = {
             "model": self._model,
             "messages": [m.to_dict() for m in messages],
             "stream": bool(stream),
             "options": self._build_options(gen),
         }
+        # Qwen3.x reasons by default and will spend the entire num_predict
+        # budget inside an unclosed <think> block, leaving nothing to say. On
+        # a CPU-only box that is not a quality trade-off, it is the difference
+        # between an answer and silence. Ollama exposes this as a top-level
+        # boolean; older daemons ignore an unknown key rather than erroring.
+        if self._think is False:
+            payload["think"] = False
+        return payload
 
     # -- generate ----------------------------------------------------------- #
     def generate(
@@ -99,6 +168,7 @@ class OllamaBackend(BaseLLM):
     ) -> LLMResult:
         self.load()
         gen = self._gen_config(config)
+        messages = self._fit(messages)
         payload = self._payload(messages, gen, stream=False)
         try:
             with self._post("/api/chat", payload) as resp:
@@ -110,11 +180,21 @@ class OllamaBackend(BaseLLM):
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"Ollama returned invalid JSON: {exc}") from exc
 
-        text = ""
+        raw_text = ""
         message = data.get("message") if isinstance(data, dict) else None
         if isinstance(message, dict):
-            text = str(message.get("content") or "")
-        text = strip_thinking(text)
+            raw_text = str(message.get("content") or "")
+            # Newer daemons return reasoning on its own field rather than in
+            # <think> tags; it must never be spoken as the answer.
+            if not raw_text:
+                thinking = message.get("thinking") or message.get("reasoning")
+                if thinking:
+                    raw_text = f"<think>{thinking}"
+        text = strip_thinking(raw_text)
+        if not text:
+            # The whole budget went into reasoning. Salvage prose from it
+            # rather than hand the agent loop an empty string.
+            text = salvage_thinking(raw_text)
         text = apply_stop_strings(text, gen.stop)
 
         finish = "stop"
@@ -139,6 +219,7 @@ class OllamaBackend(BaseLLM):
     ) -> Iterator[str]:
         self.load()
         gen = self._gen_config(config)
+        messages = self._fit(messages)
         payload = self._payload(messages, gen, stream=True)
         stops = tuple(gen.stop or ())
         buf = ""

@@ -13,12 +13,17 @@ one thread synthesizing, one thread playing — so sentence *N+1* is being
 turned into audio while sentence *N* is still sounding. The engine's own
 synthesis speed no longer gates anything but the very first sentence.
 
-A JARVIS tool call is ``<tool_call>{"name": ..., "arguments": {...}}</tool_call>``
-(see :mod:`jarvis.agent.protocol`) and must never reach the speaker — reading
-raw JSON aloud would be absurd, and a model streams that tag inline with
-ordinary prose. :func:`segment_sentences` and the tag-aware loop in
-:meth:`StreamingSpeaker.feed` keep prose and tool-call markup apart using the
-exact same tag strings ``protocol.py`` parses against, so the two can never
+Two kinds of markup a model streams inline with ordinary prose must never
+reach the speaker: a JARVIS tool call,
+``<tool_call>{"name": ..., "arguments": {...}}</tool_call>`` (see
+:mod:`jarvis.agent.protocol`), and Qwen3-style reasoning,
+``<think>...</think>`` (see :func:`jarvis.llm.base.strip_thinking` — a
+thinking model that runs out of budget mid-block is exactly why that module
+also has ``salvage_thinking``: the failure mode is real, not hypothetical, so
+a live listener must be just as deaf to an unclosed ``<think>`` as a
+non-streaming caller is). :func:`segment_sentences` and the tag-aware loop in
+:meth:`StreamingSpeaker.feed` keep prose apart from both, using the exact same
+tag strings ``protocol.py``/``base.py`` parse against, so the three can never
 drift apart.
 
 Public surface intentionally matches :class:`~jarvis.speech.tts.SpeechQueue`
@@ -55,6 +60,15 @@ DEFAULT_MAX_BUFFER = 220
 # when "Ah, quite so." was one token away. Ignored once force=True (finish()).
 DEFAULT_MIN_CHARS = 12
 
+# Tag pairs whose content must never reach the speaker. Matched case-
+# sensitively: both are documented, single-form tokens (``base.py``'s own
+# regexes use IGNORECASE for defensive robustness, but real backends emit the
+# lowercase form consistently) and a hot per-chunk loop is not the place to
+# add regex overhead for a case a real model does not produce. THINK_OPEN
+# checked before TOOL_CALL_OPEN: reasoning always precedes any tool call.
+THINK_OPEN, THINK_CLOSE = "<think>", "</think>"
+_OPAQUE_TAGS = ((THINK_OPEN, THINK_CLOSE), (TOOL_CALL_OPEN, TOOL_CALL_CLOSE))
+
 _SENTINEL = object()
 
 
@@ -72,6 +86,11 @@ def _tag_overlap(buf: str, tag: str) -> int:
     return 0
 
 
+def _max_tag_overlap(buf: str, tags) -> int:
+    """The largest hold-back needed across every opaque tag's OPEN string."""
+    return max((_tag_overlap(buf, tag) for tag in tags), default=0)
+
+
 def segment_sentences(
     buf: str, *, force: bool, max_buffer: int = DEFAULT_MAX_BUFFER,
 ) -> tuple:
@@ -80,14 +99,15 @@ def segment_sentences(
     Returns ``(units, remainder)``. A returned unit is never one that could
     still grow into a longer sentence with more text — unless ``force`` is
     set, which flushes everything as-is (used at the end of a reply, or right
-    before a ``<tool_call>`` tag where the boundary is already certain).
+    before an opaque tag where the boundary is already certain).
     """
     if force:
         text = buf.strip()
         return ([text] if text else []), ""
 
-    # Hold back a suffix that might be the start of a still-arriving tag.
-    safe_len = len(buf) - _tag_overlap(buf, TOOL_CALL_OPEN)
+    # Hold back a suffix that might be the start of a still-arriving tag —
+    # whichever of <think> / <tool_call> would need the most characters held.
+    safe_len = len(buf) - _max_tag_overlap(buf, (o for o, _ in _OPAQUE_TAGS))
     working, held = buf[:safe_len], buf[safe_len:]
 
     parts = _SENT_SPLIT_RE.split(working)
@@ -141,7 +161,7 @@ class StreamingSpeaker:
 
         self._buf = ""
         self._held_short = ""      # a short complete sentence held for merging
-        self._in_tool_call = False
+        self._in_tag: Optional[str] = None   # the CLOSE string currently awaited, if any
         self._buf_lock = threading.Lock()
 
         # Guards both `_generation` (bumped on stop() so stale queued items
@@ -214,15 +234,21 @@ class StreamingSpeaker:
         with self._buf_lock:
             self._buf += chunk
             while True:
-                if not self._in_tool_call:
-                    idx = self._buf.find(TOOL_CALL_OPEN)
-                    if idx != -1:
+                if self._in_tag is None:
+                    # Whichever opaque tag (<think>, <tool_call>) opens
+                    # soonest in the buffer, if either has arrived complete.
+                    opens = [
+                        (i, close) for open_, close in _OPAQUE_TAGS
+                        if (i := self._buf.find(open_)) != -1
+                    ]
+                    if opens:
+                        idx, close = min(opens, key=lambda p: p[0])
                         prefix = self._buf[:idx]
                         units, _ = segment_sentences(prefix, force=True)
                         for u in units:
                             self._flush_unit(u)
                         self._buf = self._buf[idx:]
-                        self._in_tool_call = True
+                        self._in_tag = close
                         continue
                     units, self._buf = segment_sentences(
                         self._buf, force=False, max_buffer=self._max_buffer,
@@ -232,11 +258,11 @@ class StreamingSpeaker:
                     for u in units:
                         self._flush_unit(u)
                 else:
-                    idx = self._buf.find(TOOL_CALL_CLOSE)
+                    idx = self._buf.find(self._in_tag)
                     if idx == -1:
                         break
-                    self._buf = self._buf[idx + len(TOOL_CALL_CLOSE):]
-                    self._in_tool_call = False
+                    self._buf = self._buf[idx + len(self._in_tag):]
+                    self._in_tag = None
                     continue
 
     def _flush_unit(self, unit: str) -> None:
@@ -253,10 +279,12 @@ class StreamingSpeaker:
     def finish(self) -> None:
         """No more text is coming for this utterance: flush whatever remains."""
         with self._buf_lock:
-            if self._in_tool_call:
-                # An unterminated tool call at end of stream: never spoken.
+            if self._in_tag is not None:
+                # An unterminated <think> or <tool_call> at end of stream:
+                # never spoken, same as a truncated one strip_thinking would
+                # also discard.
                 self._buf = ""
-                self._in_tool_call = False
+                self._in_tag = None
             else:
                 units, self._buf = segment_sentences(self._buf, force=True)
                 for u in units:
@@ -341,7 +369,7 @@ class StreamingSpeaker:
         with self._buf_lock:
             self._buf = ""
             self._held_short = ""
-            self._in_tool_call = False
+            self._in_tag = None
         for q in (self._text_q, self._audio_q):
             while True:
                 try:

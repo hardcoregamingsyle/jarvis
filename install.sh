@@ -65,11 +65,16 @@ WANT_MODEL=1
 WANT_FAST_MODEL=1
 MODEL_ID=""
 
-# The small model exists so that voice is usable on the first evening. The main
-# model is dense and thinks before it answers; at roughly 1 tok/s on a CPU-only
-# laptop that is a research assistant, not a conversation.
+# The small model is not a downgrade, it is half the architecture: the main
+# (dense, 27B) model does the thinking and the tool work, and this one turns
+# the result into the sentence that is actually spoken. See llm.voice_model in
+# config.example.yaml. On a CPU-only laptop the main model runs at roughly
+# 0.5-1 tok/s, so without the split there is no conversation to be had.
 FAST_TAG="qwen3:4b-instruct-2507-q4_K_M"
-FALLBACK_MAIN_TAG="qwen3.6:27b"
+# Smaller still, and the default llm.voice_model: purely a mouth, so 1.7B is
+# ample and it starts speaking in well under a second.
+VOICE_TAG="qwen3:1.7b"
+FALLBACK_MAIN_TAG="qwen3.8:27b"
 
 # Print the comment block at the top of this file. Deriving the help from the
 # header means the two can never drift apart, which a hard-coded line range did.
@@ -397,6 +402,22 @@ def action_configured_tag():
     return CHANGED if tag.strip() else FAILED
 
 
+def action_default_tag():
+    """The Ollama tag this version of JARVIS ships as its default.
+
+    Read from the catalogue rather than duplicated in shell, so the installer
+    and the package can never disagree about which model is current.
+    """
+    try:
+        from jarvis.llm import models
+        tag = str(models.KNOWN_MODELS[models.DEFAULT_ALIAS].ollama_tag or "")
+    except Exception as exc:
+        say("could not read the default model from the catalogue (%s)" % exc)
+        return FAILED
+    sys.stdout.write(tag + "\n")
+    return CHANGED if tag else FAILED
+
+
 def action_resolve_tag():
     """Map a Hugging Face repo id onto the Ollama tag that serves it."""
     if ":" in ARG:
@@ -489,7 +510,7 @@ def action_model():
     try:
         # On an update run, re-check the tag against the registry rather than
         # merely confirming that some copy of it exists.  An Ollama tag is a
-        # moving target -- qwen3.6:27b is re-pointed upstream when the model is
+        # moving target -- qwen3.8:27b is re-pointed upstream when the model is
         # re-quantised -- so "present" and "current" are different claims.
         # Ollama compares digests and transfers only changed layers, so this is
         # a manifest fetch when the model is already up to date.
@@ -581,6 +602,7 @@ def action_status():
 
 ACTIONS = {
     "configured-tag": action_configured_tag,
+    "default-tag": action_default_tag,
     "resolve-tag": action_resolve_tag,
     "model-size": action_model_size,
     "ollama": action_ollama,
@@ -996,6 +1018,22 @@ if [ "$WANT_MODEL" -eq 1 ] && [ "$PROFILE" != "min" ]; then
     else
         MAIN_TAG="$(runtime_capture configured-tag)"
         [ -n "$MAIN_TAG" ] || MAIN_TAG="$FALLBACK_MAIN_TAG"
+
+        # An existing config.yaml is honoured -- it is your choice of model and
+        # an installer must not silently swap it. But when it names a model this
+        # release has moved on from, saying nothing is worse: you asked for an
+        # upgrade and got the previous model with no explanation. So we tell
+        # you, and give you the one command that switches.
+        DEFAULT_TAG="$(runtime_capture default-tag)"
+        if [ -n "$DEFAULT_TAG" ] && [ "$MAIN_TAG" != "$DEFAULT_TAG" ]; then
+            warn "config.yaml pins llm.ollama_model: $MAIN_TAG"
+            warn "This release defaults to $DEFAULT_TAG. Keeping your setting."
+            warn "To switch:  ./install.sh --model $DEFAULT_TAG"
+            warn "Or edit llm.ollama_model in config.yaml and re-run."
+            # No summary line here: the main model IS still pulled a few stages
+            # below, and it records its own. Claiming "skipped" would be a
+            # plain lie about what the run did.
+        fi
     fi
 fi
 
@@ -1015,6 +1053,13 @@ ollama_model=$MAIN_TAG"
         # No colon, so it is a Hugging Face repo id rather than an Ollama tag.
         SET_LINES="$SET_LINES
 model=$MODEL_ID"
+    fi
+    # Record the voice model too. Pulling it without pointing the config at it
+    # would leave the two-model split silently switched off, which is exactly
+    # the "capable but unusably slow" configuration it exists to avoid.
+    if [ "$WANT_MODEL" -eq 1 ] && [ -n "$VOICE_TAG" ]; then
+        SET_LINES="$SET_LINES
+voice_model=$VOICE_TAG"
     fi
 
     set +e
@@ -1186,7 +1231,7 @@ fi
 OLLAMA_DATA="${OLLAMA_MODELS:-$HOME/.ollama}"
 XDG_DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
 OLLAMA_RUNTIME_GB=3          # tarball plus the unpacked libraries
-SPEECH_ASSETS_GB=2           # piper voice ~60 MB, faster-whisper base.en ~150 MB
+SPEECH_ASSETS_GB=2           # piper voice ~60 MB, faster-whisper small.en ~500 MB
 
 if [ "$WANT_MODEL" -eq 0 ]; then
     step "Skipping the inference runtime and all weights (--no-model)"
@@ -1321,6 +1366,37 @@ else
                 record "Fast model" "failed" "jarvis.runtime missing — command printed"
                 ;;
             *) record "Fast model" "failed" "ollama pull $FAST_TAG did not complete" ;;
+        esac
+    fi
+
+    # ---- the voice model --------------------------------------------------- #
+    # Small enough to be nearly free, and it is what makes a dense 27B on a CPU
+    # feel like a conversation rather than a batch job: it speaks the answer
+    # while the big model is still working. Skipped when it is already one of
+    # the two tags above.
+    if [ "$VOICE_TAG" = "$MAIN_TAG" ] || [ "$VOICE_TAG" = "$FAST_TAG" ]; then
+        record "Voice model" "skipped" "$VOICE_TAG is already being pulled"
+    else
+        VOICE_GB="$(runtime_capture model-size "$VOICE_TAG")"
+        case "$VOICE_GB" in ''|*[!0-9]*) VOICE_GB="$(model_size_gb "$VOICE_TAG")" ;; esac
+        step "Fetching the voice model: $VOICE_TAG"
+        if require_disk_space "$OLLAMA_DATA" "$((VOICE_GB + 1))" "$VOICE_TAG"; then
+            set +e
+            runtime_py model "$VOICE_TAG"
+            VOICE_STATUS=$?
+            set -e
+        else
+            VOICE_STATUS=$RT_SKIPPED
+        fi
+        case "$VOICE_STATUS" in
+            "$RT_CHANGED") ok "$VOICE_TAG is present"; record "Voice model" "updated" "$VOICE_TAG (~${VOICE_GB} GB)" ;;
+            "$RT_CURRENT") ok "$VOICE_TAG already current"; record "Voice model" "already current" "$VOICE_TAG" ;;
+            "$RT_SKIPPED") record "Voice model" "skipped" "not enough disk for ~$((VOICE_GB + 1)) GB" ;;
+            "$RT_ABSENT")
+                info "  ollama pull $VOICE_TAG"
+                record "Voice model" "failed" "jarvis.runtime missing — command printed"
+                ;;
+            *) record "Voice model" "failed" "ollama pull $VOICE_TAG did not complete" ;;
         esac
     fi
 

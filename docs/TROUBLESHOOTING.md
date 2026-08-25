@@ -34,6 +34,34 @@ them; on Windows use the `python -c "..."` form shown, in PowerShell or Git Bash
 
 ---
 
+## The installer downloads the wrong model
+
+**Symptom.** You upgraded and re-ran `./install.sh`, but it pulls `qwen3.6:27b`
+when this release defaults to `qwen3.8:27b`.
+
+**Cause.** `config.yaml` is yours and is gitignored, so an upgrade never
+rewrites your model choice. An install predating the new default still pins the
+old tag, and the installer honours it.
+
+**Fix.**
+
+```bash
+./install.sh --model qwen3.8:27b     # switch and pull
+ollama rm qwen3.6:27b                # reclaim ~18 GB
+```
+
+The installer warns about this mismatch rather than proceeding silently:
+
+```
+config.yaml pins llm.ollama_model: qwen3.6:27b
+This release defaults to qwen3.8:27b. Keeping your setting.
+To switch:  ./install.sh --model qwen3.8:27b
+```
+
+Confirm what is actually loaded with `jarvis selftest`, which prints the model
+id next to the backend.
+
+
 ## 1. "JARVIS could not start"
 
 `cli.py` prints this when `Subsystems.orchestrator is None`, which happens only when
@@ -122,7 +150,7 @@ If a real engine is selected and transcripts are *still* empty:
 | First run is downloading the Whisper model | Watch the log: `tail -f "$(python -c 'from jarvis.core.config import load_config as l; print(l().logs_dir())')/jarvis.log"` |
 | Silence threshold too high — nothing is ever captured | Raise the mic gain, or lower `stt.silence_threshold` (default `0.015`; `config.example.yaml` reports a measured room floor of ~0.007) |
 | Silence threshold too low — it records the room forever | Raise it |
-| Wrong language | `stt.language: en`, `stt.model: base.en` — the `.en` models are English-only |
+| Wrong language | `stt.language: en`, `stt.model: small.en` — the `.en` models are English-only |
 | Audio arriving as the wrong dtype/rate | Round-trip a known file: `python -c "from jarvis.core.config import load_config as l; from jarvis.speech.stt import create_stt; print(create_stt(l().stt).transcribe_file('sample.wav').text)"` |
 
 Produce that `sample.wav` with `jarvis say -o sample.wav "the quick brown fox"` and

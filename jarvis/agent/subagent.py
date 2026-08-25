@@ -29,6 +29,7 @@ from ..core.contracts import (
     ToolResult,
 )
 from ..core.events import EventBus, Events
+from ..llm.base import salvage_thinking, strip_thinking
 from .prompts import build_subagent_prompt
 from .protocol import ToolCall, parse_tool_calls, render_tool_result, strip_tool_calls
 from .task_manager import DEFAULT_MAX_DEPTH
@@ -165,6 +166,7 @@ def run_agent_loop(
     progress: Optional[ProgressFn] = None,
     bus: Optional[EventBus] = None,
     stream: bool = False,
+    tool_result_limit: int = 0,
 ) -> AgentTurn:
     """Drive the model until it produces an answer with no tool calls.
 
@@ -173,6 +175,11 @@ def run_agent_loop(
     """
     turn = AgentTurn(messages=messages)
     available = list(registry.names()) if registry is not None else []
+
+    # One tool result must never be able to consume the whole window. Reading
+    # a 40k-line Verilog file is a perfectly ordinary thing to ask for, and
+    # without a cap it evicts the system prompt and the question along with it.
+    result_chars = int(tool_result_limit) * 4 if tool_result_limit else 4000
 
     for iteration in range(1, max_iterations + 1):
         turn.iterations = iteration
@@ -202,13 +209,22 @@ def run_agent_loop(
 
         # -- no tool calls: this is the answer ------------------------------ #
         if not calls:
-            prose = strip_tool_calls(raw).strip()
+            # Backends normally strip reasoning themselves, but this loop is
+            # the last thing between a model and a speaker, so it never
+            # assumes that happened: raw <think> markup must not be read out.
+            prose = strip_tool_calls(strip_thinking(raw)).strip()
+            if not prose:
+                # A thinking model that ran out of budget mid-reasoning leaves
+                # nothing outside the <think> block. Salvage the reasoning as
+                # prose before falling back to an apology.
+                prose = strip_tool_calls(salvage_thinking(raw)).strip()
             answer = prose or _fallback_answer(turn)
             messages.append(Message.assistant(answer))
             turn.text = answer
             # `_fallback_answer` synthesises text no chunk ever carried, and
             # the non-streaming branch above never called on_chunk at all --
-            # only real prose from the streamed branch was actually heard.
+            # only real prose (surviving strip/salvage) from the streamed
+            # branch was actually heard as it generated.
             turn.streamed = bool(prose) and stream and on_chunk is not None
             return turn
 
@@ -244,7 +260,7 @@ def run_agent_loop(
 
             messages.append(
                 Message.tool(
-                    render_tool_result(call, result),
+                    render_tool_result(call, result, limit=result_chars),
                     name=call.name,
                     tool_call_id=call.id,
                 )
@@ -261,7 +277,10 @@ def run_agent_loop(
     )
     try:
         final = llm.generate(messages, gen_config).text
-        answer = strip_tool_calls(final).strip() or _fallback_answer(turn)
+        answer = strip_tool_calls(strip_thinking(final)).strip()
+        if not answer:
+            answer = strip_tool_calls(salvage_thinking(final)).strip()
+        answer = answer or _fallback_answer(turn)
     except Exception as exc:  # noqa: BLE001
         log.exception("final generation failed")
         answer = f"I ran out of steps before finishing, and the model then failed: {exc}"

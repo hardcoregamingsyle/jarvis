@@ -1616,7 +1616,7 @@ def install_service(cfg: Any = None, *, enable: bool = True,
 #  Models
 # --------------------------------------------------------------------------- #
 def normalise_tag(tag: Any) -> str:
-    """``qwen3.6`` -> ``qwen3.6:latest``; Ollama's own default, made explicit."""
+    """``qwen3.8`` -> ``qwen3.8:latest``; Ollama's own default, made explicit."""
     text = str(tag or "").strip()
     if not text:
         return ""
@@ -1642,7 +1642,10 @@ def model_tag(cfg: Any = None) -> str:
         from ..llm import models as model_catalogue
         return model_catalogue.KNOWN_MODELS[model_catalogue.DEFAULT_ALIAS].ollama_tag
     except Exception:  # noqa: BLE001
-        return "qwen3.6:27b"
+        # Last resort only, for a catalogue too broken to read. Kept in step
+        # with LLMConfig.ollama_model by test_default_model.py, because a stale
+        # literal here silently pulls the wrong (previous) model.
+        return "qwen3.8:27b"
 
 
 def list_models(host: Any = None, *, timeout: float = API_TIMEOUT) -> List[Dict[str, Any]]:
@@ -1902,7 +1905,7 @@ def ensure_model(cfg: Any = None, *, tag: Any = None, host: Any = None,
     ``refresh=True`` re-issues the pull even when the tag is already present,
     which is what makes re-running the installer genuinely update the weights
     rather than merely confirm that *some* version of them exists. A tag is a
-    moving target — ``qwen3.6:27b`` is re-pointed upstream when the model is
+    moving target — ``qwen3.8:27b`` is re-pointed upstream when the model is
     re-quantised or fixed — so "present" and "current" are not the same claim.
 
     The cost of a redundant refresh is small: Ollama compares digests and

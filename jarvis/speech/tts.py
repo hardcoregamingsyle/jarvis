@@ -929,6 +929,78 @@ def create_tts(cfg: TTSConfig, *, voices_dir: Optional[Path] = None) -> TTSEngin
 # --------------------------------------------------------------------------- #
 #  SpeechQueue — never let synthesis block the agent
 # --------------------------------------------------------------------------- #
+# Sentence splitting for streamed speech. Abbreviations are the whole
+# difficulty: naively breaking on every full stop turns "Dr. Hall" into two
+# utterances with a pause in the middle of the name.
+_ABBREV_GUARD = re.compile(
+    r"\b(?:Dr|Mr|Mrs|Ms|St|Prof|Sgt|Capt|Lt|Col|Gen|Rev|Hon|Jr|Sr|vs|etc|"
+    r"approx|e\.g|i\.e|a\.m|p\.m|No|Fig|Vol|Ch|Sec)\.$",
+    re.IGNORECASE,
+)
+_SENTENCE_END = re.compile(r"(?<=[.!?])[\"')\]]*\s+")
+#: Does this chunk actually finish a sentence?
+_ENDS_SENTENCE = re.compile(r"[.!?][\"')\]]*$")
+
+#: A trailing fragment shorter than this, and with no sentence-ending
+#: punctuation, is merged rather than spoken alone -- a dangling clause on its
+#: own sounds clipped. A *complete* short sentence ("Yes, Sir.") is fine to
+#: speak by itself and is never merged on length alone.
+_MIN_CHUNK_CHARS = 24
+#: Longer sentences are still worth splitting on a clause boundary, since a
+#: 400-character sentence defeats the point of streaming.
+_MAX_CHUNK_CHARS = 240
+
+
+def split_sentences(text: str) -> List[str]:
+    """Split ``text`` into speakable chunks, respecting abbreviations.
+
+    Returns whole sentences: handing a TTS engine half a sentence makes it
+    guess the wrong intonation, which sounds worse than the delay it saves.
+    """
+    if not text or not text.strip():
+        return []
+
+    pieces: List[str] = []
+    buffer = ""
+    for candidate in _SENTENCE_END.split(text.strip()):
+        candidate = candidate.strip()
+        if not candidate:
+            continue
+        buffer = f"{buffer} {candidate}".strip() if buffer else candidate
+        # A full stop that closes an abbreviation ("Dr.") is not the end of a
+        # sentence, so keep accumulating until a real terminator turns up.
+        if _ABBREV_GUARD.search(buffer):
+            continue
+        # A complete sentence always stands on its own, however short. Only an
+        # unterminated fragment is held back to join what follows.
+        if not _ENDS_SENTENCE.search(buffer) and len(buffer) < _MIN_CHUNK_CHARS:
+            continue
+        pieces.append(buffer)
+        buffer = ""
+    if buffer.strip():
+        tail = buffer.strip()
+        if pieces and not _ENDS_SENTENCE.search(tail) and len(tail) < _MIN_CHUNK_CHARS:
+            pieces[-1] = f"{pieces[-1]} {tail}"
+        else:
+            pieces.append(tail)
+
+    # Break up anything still too long, on clause boundaries where possible.
+    out: List[str] = []
+    for piece in pieces:
+        while len(piece) > _MAX_CHUNK_CHARS:
+            window = piece[:_MAX_CHUNK_CHARS]
+            cut = max(window.rfind("; "), window.rfind(", "), window.rfind(" -- "))
+            if cut < _MIN_CHUNK_CHARS:
+                cut = window.rfind(" ")
+            if cut < _MIN_CHUNK_CHARS:
+                break
+            out.append(piece[: cut + 1].strip())
+            piece = piece[cut + 1:].strip()
+        if piece:
+            out.append(piece)
+    return out or [text.strip()]
+
+
 class SpeechQueue:
     """Threaded speaker: the agent enqueues text, a worker speaks it.
 
@@ -955,7 +1027,18 @@ class SpeechQueue:
         return self._speaking.is_set()
 
     def say(self, text: str) -> None:
-        """Enqueue an utterance.  Non-blocking."""
+        """Enqueue an utterance.  Non-blocking.
+
+        Long text is split into sentences and queued separately so the first
+        one starts playing while the rest is still being synthesised. Piper
+        takes roughly as long as the audio it produces, so speaking a
+        paragraph as a single unit means several seconds of silence before
+        anything is heard; per-sentence it is a fraction of a second.
+
+        It also makes barge-in responsive: :meth:`stop` can drop the sentences
+        that have not been spoken yet, instead of having to wait out one large
+        buffer that is already inside the engine.
+        """
         if self._shutdown.is_set():
             return
         if text is None:
@@ -963,7 +1046,8 @@ class SpeechQueue:
         text = str(text)
         if not text.strip():
             return
-        self._queue.put(text)
+        for chunk in split_sentences(text):
+            self._queue.put(chunk)
 
     def stop(self) -> None:
         """Barge-in: drop queued items and stop current playback if possible."""
@@ -1062,4 +1146,5 @@ __all__ = [
     "create_tts",
     "available_tts_engines",
     "SpeechQueue",
+    "split_sentences",
 ]

@@ -406,3 +406,57 @@ def test_a_bare_drive_letter_resolves_to_the_cwd_not_the_root(tmp_path, monkeypa
     assert Path(drive).resolve() == Path.cwd()
     assert Path(drive + "\\").resolve() != Path.cwd()
     assert pu.is_drive_relative(drive) is True
+
+
+# --------------------------------------------------------------------------- #
+#  Logging during shutdown
+# --------------------------------------------------------------------------- #
+class TestSafeStreamHandler:
+    """Daemon threads outlive the stream they log to.
+
+    The speech queue, the task pool and subagents all log from background
+    threads. At interpreter shutdown -- or under a test runner that closes the
+    stream it swapped in -- the default StreamHandler answers a closed stream
+    with a full traceback on stderr, which looks like a crash and is not one.
+    """
+
+    def test_a_closed_stream_is_survived_silently(self, capsys):
+        import io
+        import logging
+
+        from jarvis.core.logging_setup import SafeStreamHandler
+
+        stream = io.StringIO()
+        handler = SafeStreamHandler(stream)
+        stream.close()
+
+        logger = logging.getLogger("jarvis.test.closed-stream")
+        logger.addHandler(handler)
+        try:
+            logger.error("this line is lost, and that is fine")
+        finally:
+            logger.removeHandler(handler)
+
+        captured = capsys.readouterr()
+        assert "Traceback" not in captured.err
+        assert "ValueError" not in captured.err
+
+    def test_an_open_stream_still_receives_records(self):
+        import io
+        import logging
+
+        from jarvis.core.logging_setup import SafeStreamHandler
+
+        stream = io.StringIO()
+        handler = SafeStreamHandler(stream)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+
+        logger = logging.getLogger("jarvis.test.open-stream")
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        try:
+            logger.info("this line must arrive")
+        finally:
+            logger.removeHandler(handler)
+
+        assert "this line must arrive" in stream.getvalue()
