@@ -99,6 +99,13 @@ class AgentTurn:
     tool_results: list = field(default_factory=list)
     iterations: int = 0
     truncated: bool = False       # hit max_iterations before the model finished
+    # Whether `text` was already delivered to `on_chunk` as it was generated.
+    # True for the ordinary streamed path; False for the two places `text` is
+    # produced OUTSIDE that path -- a non-streamed generate() call, and the
+    # truncated-fallback generate() after the iteration limit. A caller
+    # driving live speech from `on_chunk` needs this to know whether `text`
+    # still needs to be spoken, or was already heard as it streamed.
+    streamed: bool = False
 
     @property
     def used_tools(self) -> list:
@@ -195,9 +202,14 @@ def run_agent_loop(
 
         # -- no tool calls: this is the answer ------------------------------ #
         if not calls:
-            answer = strip_tool_calls(raw).strip() or _fallback_answer(turn)
+            prose = strip_tool_calls(raw).strip()
+            answer = prose or _fallback_answer(turn)
             messages.append(Message.assistant(answer))
             turn.text = answer
+            # `_fallback_answer` synthesises text no chunk ever carried, and
+            # the non-streaming branch above never called on_chunk at all --
+            # only real prose from the streamed branch was actually heard.
+            turn.streamed = bool(prose) and stream and on_chunk is not None
             return turn
 
         # The model may have prefaced its calls with prose; keep it verbatim so

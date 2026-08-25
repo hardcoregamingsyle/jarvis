@@ -928,6 +928,20 @@ class AudioPlayer:
             except Exception:
                 log.debug("winsound purge failed", exc_info=True)
 
+    def play(self, data: bytes) -> bool:
+        """Alias for :meth:`play_wav`.
+
+        Every TTS engine's ``speak()`` (piper/edge/pyttsx3/espeak, in
+        ``speech/tts.py``) calls ``AudioPlayer().play(data)`` — a method that
+        did not exist here. That raised ``AttributeError`` on every single
+        utterance, silently caught by the engine's surrounding
+        ``except Exception`` and falling back to writing a temp file and
+        shelling out to the OS's default media player. Net effect: the fast
+        ``sounddevice``/``simpleaudio`` path below was unreachable from any
+        real call site, and every utterance paid a process-spawn instead.
+        """
+        return self.play_wav(data)
+
     def play_wav(self, data: bytes) -> bool:
         """Play the given WAV bytes.  Returns True when playback succeeded."""
         if not data:

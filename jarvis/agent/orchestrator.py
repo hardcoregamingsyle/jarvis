@@ -49,13 +49,24 @@ class Orchestrator:
         tts: Any = None,
         bus: Optional[EventBus] = None,
         task_manager: Optional[TaskManager] = None,
+        task_llm: Optional[LLMBackend] = None,
     ) -> None:
         self.config = config
         self.llm = llm
+        # The model spawn_task delegates to. Falls back to `llm` itself when
+        # none is configured, which is exactly today's single-backend
+        # behaviour -- nothing changes for a setup that doesn't opt in.
+        self.task_llm = task_llm or llm
         self.registry = registry
         self.context = context
         self.tts = tts
         self.bus = bus or get_bus()
+        # Duck-typed rather than isinstance-checked, so any object exposing
+        # feed()/finish() (StreamingSpeaker's contract) qualifies -- tests can
+        # swap in a fake without importing the real class.
+        self._live_speech = bool(
+            tts is not None and hasattr(tts, "feed") and hasattr(tts, "finish")
+        )
 
         # Tree limits are resource management, not permission: they stop one
         # mis-prompted agent turning into a fork bomb.  Read defensively because
@@ -70,12 +81,35 @@ class Orchestrator:
             ),
         )
 
-        self._env = environment_block(
-            system_summary(),
-            extra_lines=[
-                f"llm backend: {getattr(llm, 'name', 'unknown')} ({config.llm.model})",
-            ],
-        )
+        env_lines = [
+            f"llm backend: {getattr(llm, 'name', 'unknown')} ({config.llm.model})",
+        ]
+        # When a separate, more capable model is configured for spawn_task,
+        # this becomes the persona's ONE job: hold the conversation, answer
+        # what is genuinely quick, and delegate the rest immediately rather
+        # than working through a long tool chain on a small, fast model that
+        # was never meant to carry it.
+        self._router_extra = ""
+        if self.task_llm is not llm:
+            task_model = getattr(config.llm, "task_model", "") or getattr(
+                config.llm, "task_ollama_model", ""
+            ) or config.llm.model
+            env_lines.append(
+                f"spawn_task delegates to a SEPARATE, more capable model: "
+                f"{getattr(self.task_llm, 'name', 'unknown')} ({task_model})."
+            )
+            self._router_extra = (
+                "You are the fast, conversational front end of a two-model "
+                f"setup; {task_model} is the deep-work model behind spawn_task. "
+                "Answer directly only what you can genuinely do in one or two "
+                "quick steps. For anything that touches multiple files, runs "
+                "more than a command or two, needs real research, or will take "
+                "more than a few seconds — call spawn_task at once, say a short "
+                "acknowledgement, and move on. Do not chain many tool calls "
+                "yourself trying to finish it inline; that is spawn_task's job, "
+                "not yours."
+            )
+        self._env = environment_block(system_summary(), extra_lines=env_lines)
         self._lock = threading.RLock()
         self._speaking_enabled = bool(config.tts.enabled)
 
@@ -108,6 +142,23 @@ class Orchestrator:
             top_k=llm_cfg.top_k,
         )
 
+    def _task_gen_config(self) -> GenerationConfig:
+        """Generation settings for work delegated via spawn_task.
+
+        Deliberately separate from :meth:`_gen_config`: the task model is
+        usually doing more substantial work and reasonably wants a longer
+        leash (``task_max_new_tokens`` defaults to 1024 against the router's
+        512), while top_p/top_k are shared since neither field has a
+        task-specific override yet.
+        """
+        llm_cfg = self.config.llm
+        return GenerationConfig(
+            max_new_tokens=getattr(llm_cfg, "task_max_new_tokens", llm_cfg.max_new_tokens),
+            temperature=getattr(llm_cfg, "task_temperature", llm_cfg.temperature),
+            top_p=llm_cfg.top_p,
+            top_k=llm_cfg.top_k,
+        )
+
     # ------------------------------------------------------------------ #
     #  Conversation
     # ------------------------------------------------------------------ #
@@ -119,12 +170,29 @@ class Orchestrator:
         on_chunk: Optional[Callable[[str], None]] = None,
         stream: bool = False,
     ) -> str:
-        """Handle one user turn and return the spoken reply."""
+        """Handle one user turn and return the spoken reply.
+
+        When a live-speech TTS is configured (``StreamingSpeaker`` or
+        anything duck-typed the same way) and speaking is enabled, the model
+        is streamed and spoken sentence-by-sentence AS it generates, not
+        after the full reply exists — this is what makes the router feel
+        instant rather than waiting for a whole reply before making a sound.
+        A caller-supplied ``on_chunk``/``stream`` still work as before (e.g.
+        a UI transcript) and run alongside the live speech, not instead of it.
+        """
         user_input = (user_input or "").strip()
         if not user_input:
             return ""
 
         self.bus.emit(Events.USER_UTTERANCE, user_input)
+        want_speech = speak if speak is not None else self._speaking_enabled
+        live = want_speech and self._live_speech
+
+        def _on_chunk(piece: str) -> None:
+            if live:
+                self.tts.feed(piece)
+            if on_chunk is not None:
+                on_chunk(piece)
 
         with self._lock:
             # Any finished background work is folded into this turn's context.
@@ -143,9 +211,9 @@ class Orchestrator:
                 messages,
                 max_iterations=self.config.agent.max_tool_iterations,
                 gen_config=self._gen_config(),
-                on_chunk=on_chunk,
+                on_chunk=_on_chunk if (live or on_chunk is not None) else None,
                 bus=self.bus,
-                stream=stream,
+                stream=stream or live,
             )
 
             reply = turn.text or "I'm afraid I have nothing useful to say to that."
@@ -156,7 +224,15 @@ class Orchestrator:
                 log.exception("summarisation failed")
 
         self.bus.emit(Events.ASSISTANT_REPLY, reply)
-        if speak if speak is not None else self._speaking_enabled:
+        if live:
+            # turn.streamed tells us whether `reply` already went out through
+            # _on_chunk (the ordinary path) or was produced outside it (the
+            # synthetic fallback answer, or the truncated-loop generate()) --
+            # only the latter still needs to be handed to the speaker.
+            if not turn.streamed:
+                self.tts.feed(reply)
+            self.tts.finish()
+        elif want_speech:
             self.say(reply)
         return reply
 
@@ -210,12 +286,12 @@ class Orchestrator:
         child_depth = getattr(self.tasks, "child_depth", None)
         depth = child_depth(parent_id) if child_depth is not None else 0
         sub = SubAgent(
-            self.llm,
+            self.task_llm,
             self.registry,
             agent_name=self.config.agent.name,
             environment=self._env,
             max_iterations=max(4, self.config.agent.max_tool_iterations * 2),
-            gen_config=self._gen_config(),
+            gen_config=self._task_gen_config(),
             bus=self.bus,
             depth=depth,
             parent_id=parent_id,
@@ -471,7 +547,10 @@ class Orchestrator:
             self.tasks.shutdown(wait=wait)
         except Exception:  # noqa: BLE001
             log.debug("task manager shutdown raised", exc_info=True)
-        for resource in (self.tts, self.llm, getattr(self.context, "store", None)):
+        resources = [self.tts, self.llm, getattr(self.context, "store", None)]
+        if self.task_llm is not self.llm:
+            resources.append(self.task_llm)
+        for resource in resources:
             for method in ("shutdown", "close", "unload"):
                 fn = getattr(resource, method, None)
                 if callable(fn):

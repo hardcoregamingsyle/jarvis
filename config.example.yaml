@@ -13,10 +13,9 @@
 # Language model
 # ---------------------------------------------------------------------------
 llm:
-  # auto | ollama | transformers | airllm | stub
-  #   "auto" probes ollama -> transformers -> airllm and takes the first that
-  #   works. AirLLM is probed LAST on purpose: its availability check is only an
-  #   import test, and it is ~100x slower than Ollama for a model that fits RAM.
+  # auto | ollama | transformers | openai-compat | vllm | airllm | stub
+  #   "auto" probes vllm -> ollama -> openai-compat -> transformers -> airllm
+  #   and takes the first that works.
   backend: auto
 
   # Any Hugging Face repo id. `jarvis model list` shows the known aliases.
@@ -49,6 +48,40 @@ llm:
 
   allow_fallback: true
   request_timeout: 600.0
+
+  # -------------------------------------------------------------------------
+  # OPTIONAL: a second, ROUTER + TASK setup instead of one all-purpose model
+  # -------------------------------------------------------------------------
+  # Left empty (the default), spawn_task reuses the model/ollama_model above
+  # and JARVIS behaves exactly as it always has — one backend for everything.
+  #
+  # Set BOTH halves below to run a genuinely different shape instead: a fast
+  # small model in the seat above (it becomes the ROUTER — the one holding
+  # the live conversation and speaking; see tts.streaming below, since its
+  # token stream is what drives live speech, so its latency IS the
+  # assistant's latency) and a separate, heavier model behind spawn_task for
+  # anything substantial. The router keeps talking while that one works, and
+  # relays the report through speech when it lands.
+  #
+  #   1. Change model/ollama_model above to the fast one:
+  #        model: Qwen/Qwen3-4B-Instruct-2507
+  #        ollama_model: qwen3:4b-instruct-2507-q4_K_M
+  #   2. Point spawn_task at the heavy one, e.g. a MiniLLM-hosted
+  #      llama-server on another machine serving Qwen3.8-27B:
+  #        task_backend: openai-compat
+  #        task_base_url: http://<that machine>:8080/v1
+  #      — or the dense 27B via Ollama on this same host, i.e. what
+  #      model/ollama_model pointed at before step 1:
+  #        task_backend: ollama
+  #        task_ollama_model: qwen3.6:27b
+  task_backend: ""
+  task_model: ""
+  task_ollama_model: ""
+  task_base_url: ""
+  task_api_key: ""
+  task_max_new_tokens: 1024
+  task_temperature: 0.7
+  task_request_timeout: 900.0
 
 # ---------------------------------------------------------------------------
 # Speech to text
@@ -105,6 +138,20 @@ tts:
   volume: 1.0
   output_device: null
   enabled: true
+
+  # Speak the router's reply live, sentence by sentence, AS it streams —
+  # instead of waiting for the whole reply and synthesizing it as one block.
+  # This is what makes the router feel instant. false falls back to the old
+  # whole-utterance behaviour. See jarvis.speech.streaming_tts.
+  streaming: true
+  # A sentence shorter than this many characters is held and merged into the
+  # next one, rather than firing a separate synth+play round trip for one
+  # short word ("Ah." + "Quite so." speaks as one clause, not two beats).
+  stream_min_chars: 12
+  # No sentence-ending punctuation for this many characters -> speak what has
+  # arrived on a whitespace boundary anyway, so a reply without punctuation
+  # is still heard incrementally instead of staying silent until it ends.
+  stream_max_buffer: 220
 
 # ---------------------------------------------------------------------------
 # Memory — the "forgets nothing" store

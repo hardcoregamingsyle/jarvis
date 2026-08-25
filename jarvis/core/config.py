@@ -61,9 +61,29 @@ class LLMConfig:
         CPU-only box has one set of cores: letting a swarm of subagents issue
         unbounded parallel requests turns a slow answer into no answer at all
         and can exhaust memory.  ``0`` disables the cap.
+
+    Two backends, one opt-in:
+      By default there is exactly one backend — everything below describes
+      it, unchanged from how JARVIS has always worked — and ``spawn_task``
+      simply reuses it, because ``task_backend`` and friends are empty.
+
+      Setting the ``task_*`` fields turns that one backend into two, with two
+      different jobs. ``backend``/``model``/``ollama_model`` above then
+      becomes the ROUTER: the model that holds the conversation and answers
+      directly, small and fast enough that its own tokens can drive live
+      speech (see :mod:`jarvis.speech.streaming_tts`) — its latency IS the
+      assistant's latency, so this is where ``qwen3:4b-instruct-2507-q4_K_M``
+      belongs, not a dense 27B. The ``task_*`` fields then describe the model
+      ``spawn_task`` dispatches a background
+      :class:`~jarvis.agent.subagent.SubAgent` to — a dense 27B, or a larger
+      model served elsewhere as an OpenAI-compatible endpoint (llama.cpp's
+      ``llama-server``, vLLM, ...). Its latency does not matter the same way:
+      the router has already answered and is not waiting on it, and the
+      result is relayed through TTS when it lands. See
+      ``config.example.yaml`` for a worked two-tier example.
     """
 
-    # "airllm", "ollama", "transformers", "stub", or "auto".
+    # "airllm", "ollama", "transformers", "openai-compat", "stub", or "auto".
     backend: str = "auto"
     # Qwen3.6-27B: dense 27B, vision-language, 262K native context. The most
     # capable model that still fits 32 GB at Q4 (~16 GB), and it needs
@@ -73,7 +93,8 @@ class LLMConfig:
     # token, where Qwen3-30B-A3B activates only ~3B. On a CPU-only box that is
     # roughly 1 tok/s against 4-8. It also thinks by default, emitting hundreds
     # of <think> tokens before it answers. For live voice on such a machine,
-    # prefer `qwen3-4b` here and leave this one to background subagents.
+    # prefer `qwen3-4b` here and leave this one to `task_model` below, reached
+    # through `spawn_task` rather than the interactive path.
     model: str = "Qwen/Qwen3.6-27B"
     # AirLLM streams layers from disk; this is where they get cached.
     compression: str = ""            # "" | "4bit" | "8bit"  (needs bitsandbytes)
@@ -99,6 +120,24 @@ class LLMConfig:
     # Fail over to the next available backend instead of raising.
     allow_fallback: bool = True
     request_timeout: float = 600.0
+
+    # -- Task / delegated model -------------------------------------------- #
+    # Empty (the default) = mirror the backend/model above, i.e. today's
+    # single-backend behaviour, exactly unchanged. Fill these in to hand
+    # `spawn_task` a SEPARATE, heavier model while `model`/`ollama_model`
+    # above becomes a fast router — e.g. a MiniLLM-hosted llama-server
+    # serving Qwen3.8-27B:
+    #   model: Qwen/Qwen3-4B-Instruct-2507   (router, fast, conversational)
+    #   task_backend: openai-compat
+    #   task_base_url: http://<the other machine>:8080/v1
+    task_backend: str = ""
+    task_model: str = ""
+    task_ollama_model: str = ""
+    task_base_url: str = ""          # e.g. a llama.cpp llama-server's http://host:port/v1
+    task_api_key: str = ""
+    task_max_new_tokens: int = 1024
+    task_temperature: float = 0.7
+    task_request_timeout: float = 900.0
 
 
 @dataclass
@@ -134,6 +173,20 @@ class TTSConfig:
     volume: float = 1.0
     output_device: Optional[int] = None
     enabled: bool = True
+
+    # Speak the router's reply live, sentence by sentence, as it streams --
+    # instead of waiting for the whole reply and synthesizing it as one
+    # block. See jarvis.speech.streaming_tts.StreamingSpeaker. Off falls back
+    # to today's whole-utterance SpeechQueue.
+    streaming: bool = True
+    # A sentence shorter than this is held and merged into the next one,
+    # rather than firing a synth+play round trip for one short word.
+    stream_min_chars: int = 12
+    # No sentence-ending punctuation for this many characters -> speak what
+    # has arrived on a whitespace boundary anyway, so a reply without
+    # punctuation is still heard incrementally rather than staying silent
+    # until the whole thing is done.
+    stream_max_buffer: int = 220
 
 
 @dataclass

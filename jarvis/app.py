@@ -31,6 +31,7 @@ class Subsystems:
     bus: EventBus
     security: SecurityGate
     llm: Any = None
+    task_llm: Any = None
     memory: Any = None
     context: Any = None
     registry: Any = None
@@ -50,6 +51,7 @@ class Subsystems:
         status = {
             "llm": describe(self.llm),
             "model": self.config.llm.model,
+            "task_llm": describe(self.task_llm) if self.task_llm is not None else "(shares llm)",
             "stt": describe(self.stt),
             "tts": describe(self.tts),
             "memory": "sqlite" if self.memory is not None else "unavailable",
@@ -74,6 +76,60 @@ def _build_llm(cfg: Config) -> Any:
         return backend
     except Exception:  # noqa: BLE001
         log.exception("could not create an LLM backend; conversation will not work")
+        return None
+
+
+def _task_llm_config(llm_cfg: Any) -> Any:
+    """A config for the model spawn_task delegates to: `task_*` fields
+    overlaid on the router's own settings, so anything not overridden (a
+    connection timeout, request retries, ...) still behaves sensibly."""
+    import copy
+
+    task_cfg = copy.copy(llm_cfg)
+    if llm_cfg.task_backend:
+        task_cfg.backend = llm_cfg.task_backend
+    if llm_cfg.task_model:
+        task_cfg.model = llm_cfg.task_model
+    if llm_cfg.task_ollama_model:
+        task_cfg.ollama_model = llm_cfg.task_ollama_model
+    if llm_cfg.task_base_url:
+        task_cfg.vllm_host = llm_cfg.task_base_url
+    if llm_cfg.task_api_key:
+        task_cfg.api_key = llm_cfg.task_api_key
+    task_cfg.max_new_tokens = llm_cfg.task_max_new_tokens
+    task_cfg.temperature = llm_cfg.task_temperature
+    task_cfg.request_timeout = llm_cfg.task_request_timeout
+    return task_cfg
+
+
+def _build_task_llm(cfg: Config) -> Any:
+    """The heavier model `spawn_task` dispatches work to.
+
+    None of the `llm.task_*` fields set -> returns None, and Orchestrator
+    falls back to the router's own backend -- today's single-backend
+    behaviour, unchanged, for anyone who has not opted into a two-tier setup.
+    """
+    llm_cfg = cfg.llm
+    if not any((
+        llm_cfg.task_backend, llm_cfg.task_model,
+        llm_cfg.task_ollama_model, llm_cfg.task_base_url,
+    )):
+        return None
+    try:
+        from .llm import create_llm
+
+        task_cfg = _task_llm_config(llm_cfg)
+        backend = create_llm(task_cfg)
+        log.info(
+            "Task LLM backend (spawn_task): %s (%s)",
+            getattr(backend, "name", "?"), task_cfg.model,
+        )
+        return backend
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "could not create the task LLM backend; spawn_task will use the "
+            "router model instead"
+        )
         return None
 
 
@@ -124,7 +180,17 @@ def _build_speech(cfg: Config):
 
         tts = create_tts(cfg.tts, voices_dir=cfg.voices_dir())
         log.info("text-to-speech: %s (%s)", getattr(tts, "name", "?"), cfg.tts.piper_voice)
-        queue = SpeechQueue(tts)
+        if cfg.tts.streaming:
+            from .speech.streaming_tts import StreamingSpeaker
+
+            queue = StreamingSpeaker(
+                tts,
+                min_chars=cfg.tts.stream_min_chars,
+                max_buffer=cfg.tts.stream_max_buffer,
+            )
+            log.info("speech is live-streamed sentence by sentence")
+        else:
+            queue = SpeechQueue(tts)
     except Exception:  # noqa: BLE001
         log.exception("text-to-speech unavailable")
 
@@ -147,6 +213,7 @@ def build(
     security = SecurityGate(cfg.security, audit_path=cfg.logs_dir() / "audit.jsonl")
 
     llm = _build_llm(cfg)
+    task_llm = _build_task_llm(cfg)
     store, context = _build_memory(cfg)
     registry = _build_tools(cfg, security, bus, store)
     stt, tts, queue = _build_speech(cfg)
@@ -154,7 +221,7 @@ def build(
     orchestrator = None
     if llm is not None and context is not None:
         orchestrator = Orchestrator(
-            cfg, llm, registry, context, tts=queue or tts, bus=bus
+            cfg, llm, registry, context, tts=queue or tts, bus=bus, task_llm=task_llm,
         )
     else:
         log.error("orchestrator not created: LLM=%s memory=%s", llm, context)
@@ -164,6 +231,7 @@ def build(
         bus=bus,
         security=security,
         llm=llm,
+        task_llm=task_llm,
         memory=store,
         context=context,
         registry=registry,
@@ -182,6 +250,7 @@ def shutdown(subsystems: Subsystems) -> None:
         ("orchestrator", subsystems.orchestrator, ("shutdown",)),
         ("speech queue", subsystems.speech_queue, ("shutdown", "stop")),
         ("llm", subsystems.llm, ("unload",)),
+        ("task llm", subsystems.task_llm, ("unload",)),
         ("memory", subsystems.memory, ("close",)),
     ):
         if obj is None:

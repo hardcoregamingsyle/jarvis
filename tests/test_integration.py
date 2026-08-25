@@ -39,6 +39,12 @@ def booted(config, scripted_llm):
     subsystems.llm = llm
     if subsystems.orchestrator is not None:
         subsystems.orchestrator.llm = llm
+        # task_llm defaults to whatever `llm` was AT CONSTRUCTION TIME
+        # (Orchestrator.__init__: `self.task_llm = task_llm or llm`), so it
+        # is still pointing at the original stub unless also repointed here.
+        # None of these tests configure a genuinely separate task backend, so
+        # spawn_task should land on the same scripted LLM as everything else.
+        subsystems.orchestrator.task_llm = llm
     if subsystems.registry is not None:
         subsystems.registry.ctx.extra["llm"] = llm
 

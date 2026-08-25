@@ -709,6 +709,39 @@ a 32 GB machine, Qwen3-30B-A3B quantised to ~18 GB *does* fit, and Ollama runs
 the same weights roughly a hundred times faster. Use AirLLM for a 70B+ dense
 model you cannot otherwise load, and for nothing else.
 
+### Router + task: two models instead of one
+
+By default there is one backend and `spawn_task` reuses it — unchanged from
+how JARVIS has always worked. Setting `llm.task_*` in the config splits that
+into two models with two different jobs:
+
+- **`llm.model`/`llm.ollama_model`** becomes the **router** — small, fast,
+  holds the live conversation and speaks. Its own token stream drives live
+  speech (see [Barge-in](#barge-in) below), so its latency *is* the
+  assistant's latency: `qwen3:4b-instruct-2507-q4_K_M` (~15–25 tok/s on CPU)
+  belongs here, not a dense 27B.
+- **`llm.task_backend`/`llm.task_model`/`llm.task_base_url`** becomes what
+  `spawn_task` — JARVIS's existing background-delegation tool — actually
+  dispatches to. Nothing new to learn: the router already has "call
+  `spawn_task` for anything substantial" in its instructions, so pointing
+  that tool at a heavier model is the entire mechanism. The router keeps
+  talking while it works, and relays the report through speech when it lands.
+
+```yaml
+llm:
+  model: Qwen/Qwen3-4B-Instruct-2507        # the router
+  ollama_model: qwen3:4b-instruct-2507-q4_K_M
+
+  task_backend: openai-compat                # what spawn_task uses instead
+  task_base_url: http://<host>:8080/v1        # e.g. a llama.cpp llama-server
+```
+
+`task_base_url` can point anywhere an OpenAI-compatible server answers —
+including a separately hosted MoE far larger than would ever fit locally, or
+this same machine's Ollama running the dense 27B (`task_backend: ollama`,
+`task_ollama_model: qwen3.6:27b`) — since the router no longer has to be that
+model too. See `config.example.yaml` for the full worked example.
+
 ---
 
 ## Hardware & compatibility
@@ -771,6 +804,28 @@ voice:
   allow_interrupt: true
   greeting: "Good day. All systems are online and at your disposal."
 ```
+
+### Live speech
+
+`tts.streaming: true` (the default) speaks the reply live, sentence by
+sentence, as the model generates it — not after the whole reply exists. Two
+threads pipeline the work: one synthesizes each sentence to audio as fast as
+the engine allows, the other plays finished sentences in order, so sentence
+two is already being synthesized while sentence one is still sounding. The
+model's own tool-call syntax (`<tool_call>...</tool_call>`) is recognised and
+never spoken — only the prose around it is.
+
+```yaml
+tts:
+  streaming: true
+  stream_min_chars: 12     # merge a sentence shorter than this into the next
+  stream_max_buffer: 220   # speak on a whitespace boundary if punctuation
+                            # never arrives, rather than staying silent
+```
+
+Set `streaming: false` to fall back to the previous whole-utterance
+behaviour. Barge-in works identically either way: interrupting drops whatever
+is queued or mid-synthesis, not just what is currently sounding.
 
 ### The British voices
 
