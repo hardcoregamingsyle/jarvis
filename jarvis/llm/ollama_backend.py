@@ -60,6 +60,35 @@ def _default_thread_count() -> int:
         return 0
 
 
+def _describe_ollama_error(exc: "_urlerror.URLError") -> str:
+    """The useful half of a failed Ollama request, which ``str(exc)`` throws away.
+
+    ``HTTPError`` (a ``URLError`` subclass) IS the response body -- it is a
+    file-like object -- but nothing was ever reading it. Ollama's 4xx/5xx
+    responses are JSON with a real diagnosis (``{"error": "model requires
+    more system memory (X GiB) than is available (Y GiB)"}`` is the single
+    most common one on a CPU box with a context window sized past what the
+    machine can actually hold), so "HTTP Error 500: Internal Server Error"
+    was hiding the one fact that would have made the failure self-explanatory
+    instead of needing a bug report to decode.
+    """
+    body = ""
+    if isinstance(exc, _urlerror.HTTPError):
+        try:
+            body = exc.read().decode("utf-8", "replace").strip()
+        except Exception:  # noqa: BLE001 - the body is a bonus, not a requirement
+            body = ""
+    if body:
+        try:
+            parsed = json.loads(body)
+            if isinstance(parsed, dict) and parsed.get("error"):
+                return f"{exc} -- {parsed['error']}"
+        except json.JSONDecodeError:
+            pass
+        return f"{exc} -- {body[:500]}"
+    return str(exc)
+
+
 class OllamaBackend(BaseLLM):
     """Talks to a local Ollama daemon over HTTP."""
 
@@ -174,7 +203,7 @@ class OllamaBackend(BaseLLM):
             with self._post("/api/chat", payload) as resp:
                 body = resp.read().decode("utf-8", "replace")
         except _urlerror.URLError as exc:
-            raise RuntimeError(f"Ollama request failed: {exc}") from exc
+            raise RuntimeError(f"Ollama request failed: {_describe_ollama_error(exc)}") from exc
         try:
             data = json.loads(body)
         except json.JSONDecodeError as exc:
@@ -226,7 +255,9 @@ class OllamaBackend(BaseLLM):
         try:
             resp = self._post("/api/chat", payload)
         except _urlerror.URLError as exc:
-            raise RuntimeError(f"Ollama streaming request failed: {exc}") from exc
+            raise RuntimeError(
+                f"Ollama streaming request failed: {_describe_ollama_error(exc)}"
+            ) from exc
         try:
             for raw_line in resp:
                 line = raw_line.decode("utf-8", "replace").strip()
@@ -264,7 +295,13 @@ class OllamaBackend(BaseLLM):
         try:
             with self._get("/api/tags", timeout=self._timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8", "replace"))
-        except (_urlerror.URLError, json.JSONDecodeError) as exc:
+        except _urlerror.URLError as exc:
+            raise RuntimeError(
+                f"Could not reach Ollama at {self._host}: "
+                f"{_describe_ollama_error(exc)}. "
+                f"Install and start it from https://ollama.com."
+            ) from exc
+        except json.JSONDecodeError as exc:
             raise RuntimeError(
                 f"Could not reach Ollama at {self._host}: {exc}. "
                 f"Install and start it from https://ollama.com."
