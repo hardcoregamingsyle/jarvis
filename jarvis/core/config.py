@@ -353,13 +353,15 @@ class AgentConfig:
     # to make every turn wait for its own answer (which is what one-shot
     # `jarvis ask` does, since there is no later turn to relay a report on).
     background_heavy_work: bool = True
-    # How long a dispatched turn is waited on before it is left to finish in
-    # the background. Not all heavy work is SLOW work -- a single tool call
-    # settles in seconds, and deferring that would be as wrong as blocking for
-    # minutes on a research task -- so this is the line between the two.
-    # Lower it for a snappier hand-off, raise it to let more work finish
-    # in-turn. 0 defers everything immediately.
-    background_after_seconds: float = 15.0
+    # THE HARD CEILING ON HOW LONG ANY TURN MAY TAKE. A dispatched turn is
+    # waited on for this long; whatever has not finished by then is left to
+    # run in the background and relayed later. So a reply always lands within
+    # this many seconds, no matter how slow the model or how large the job.
+    #
+    # It doubles as the line between quick and slow work: a single tool call
+    # often settles inside it and answers within the turn, while a research
+    # task will not and gets handed off. 0 defers everything immediately.
+    background_after_seconds: float = 5.0
 
 
 @dataclass
