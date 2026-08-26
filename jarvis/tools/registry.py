@@ -479,6 +479,7 @@ class ToolRegistry:
             "system_tools",
             "process_tools",
             "web_tools",
+            "pdf_tools",
             "app_tools",
             "input_tools",
             "window_tools",
