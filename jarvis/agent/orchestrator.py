@@ -219,9 +219,21 @@ class Orchestrator:
                 self.context.add_user(user_input)
                 self.context.add_assistant(reply)
                 self.bus.emit(Events.ASSISTANT_REPLY, reply)
-                if speak if speak is not None else self._speaking_enabled:
+                if want_speech:
                     self.say(reply, phrase=False)
                 return reply
+
+        # Everything past this point is the slow path: the big model, quite
+        # possibly with tool calls. Live streaming only helps once the model
+        # is actually talking -- a tool call with no spoken preamble (which is
+        # the common shape for "research X", "check the logs", ...) produces
+        # total silence until it resolves or fails. Speak the instant holding
+        # line here, inside chat() itself, so EVERY caller gets it uniformly
+        # -- the voice loop, `jarvis chat`, `jarvis ask`, the HTTP server --
+        # rather than only whichever ones remembered to call acknowledge()
+        # themselves first. Never fires on the fast path above.
+        if want_speech:
+            self.acknowledge()
 
         with self._lock:
             # Any finished background work is folded into this turn's context.
