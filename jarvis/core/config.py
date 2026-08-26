@@ -343,6 +343,23 @@ class AgentConfig:
     announce_updates: bool = True
     # Let the agent write brand-new tools when a capability is missing.
     allow_tool_creation: bool = True
+    # Anything the router escalates to the big model runs as a BACKGROUND
+    # subagent instead of blocking the turn. The small model answers
+    # immediately and the subagent's report is relayed when it lands.
+    #
+    # This is the difference between an assistant and a batch job on a
+    # CPU-only box: a dense 27B at ~0.5-1 tok/s takes minutes on real work,
+    # and blocking the conversation for that long reads as a crash. Set False
+    # to make every turn wait for its own answer (which is what one-shot
+    # `jarvis ask` does, since there is no later turn to relay a report on).
+    background_heavy_work: bool = True
+    # How long a dispatched turn is waited on before it is left to finish in
+    # the background. Not all heavy work is SLOW work -- a single tool call
+    # settles in seconds, and deferring that would be as wrong as blocking for
+    # minutes on a research task -- so this is the line between the two.
+    # Lower it for a snappier hand-off, raise it to let more work finish
+    # in-turn. 0 defers everything immediately.
+    background_after_seconds: float = 15.0
 
 
 @dataclass

@@ -183,16 +183,32 @@ class Orchestrator:
         speak: Optional[bool] = None,
         on_chunk: Optional[Callable[[str], None]] = None,
         stream: bool = False,
+        background: Optional[bool] = None,
     ) -> str:
         """Handle one user turn and return the spoken reply.
+
+        Three shapes, in the order they are tried:
+
+        1. **Light route** — a greeting, a status question, a pause/resume
+           command. The small model (or local state) answers outright and the
+           big one is never woken.
+        2. **Heavy route, backgrounded** (the default) — the small model
+           immediately says what it is about to do, in its own words, and the
+           actual work is handed to a subagent. This returns at once; the
+           subagent's report is relayed on a later turn. A dense 27B doing
+           real work takes minutes on a CPU-only box, and blocking the
+           conversation for that long reads as a crash rather than as effort.
+        3. **Heavy route, blocking** (``background=False``, or
+           ``agent.background_heavy_work: false``) — the same work, but the
+           turn waits for it. One-shot callers such as ``jarvis ask`` need
+           this, because there is no later turn on which to relay a report.
 
         When a live-speech TTS is configured (``StreamingSpeaker`` or
         anything duck-typed the same way) and speaking is enabled, the model
         is streamed and spoken sentence-by-sentence AS it generates, not
-        after the full reply exists — this is what makes the router feel
-        instant rather than waiting for a whole reply before making a sound.
-        A caller-supplied ``on_chunk``/``stream`` still work as before (e.g.
-        a UI transcript) and run alongside the live speech, not instead of it.
+        after the full reply exists. A caller-supplied ``on_chunk``/``stream``
+        still work as before (e.g. a UI transcript) and run alongside the live
+        speech, not instead of it.
         """
         user_input = (user_input or "").strip()
         if not user_input:
@@ -223,17 +239,67 @@ class Orchestrator:
                     self.say(reply, phrase=False)
                 return reply
 
-        # Everything past this point is the slow path: the big model, quite
-        # possibly with tool calls. Live streaming only helps once the model
-        # is actually talking -- a tool call with no spoken preamble (which is
-        # the common shape for "research X", "check the logs", ...) produces
-        # total silence until it resolves or fails. Speak the instant holding
-        # line here, inside chat() itself, so EVERY caller gets it uniformly
-        # -- the voice loop, `jarvis chat`, `jarvis ask`, the HTTP server --
-        # rather than only whichever ones remembered to call acknowledge()
-        # themselves first. Never fires on the fast path above.
-        if want_speech:
-            self.acknowledge()
+        # -- the slow path ------------------------------------------------ #
+        # The small model answers FIRST, and contextually. Previously the big
+        # model owned this whole branch, so the moment a request was worth
+        # escalating the user heard nothing at all until it finished -- which
+        # on a CPU-only box is minutes, and reads as a crash. Now the fast
+        # model names the request back immediately, and the slow work happens
+        # behind that.
+        opening = self._opening_line(user_input)
+        if opening and want_speech:
+            self.say(opening, phrase=False)
+
+        if self._wants_background(background):
+            # Dispatch first, then wait a GRACE PERIOD on it. Not all heavy
+            # work is slow work: "what does that note say" needs the big model
+            # and a tool call but settles in seconds, and deferring that would
+            # be as wrong as blocking for minutes on a research task. So quick
+            # work still answers within this turn, and only work that genuinely
+            # outruns the grace period is handed off to be relayed later.
+            task = self.spawn_task(user_input)
+            grace = float(getattr(self.config.agent, "background_after_seconds", 15.0))
+            settled = None
+            if grace > 0:
+                try:
+                    settled = self.tasks.wait(task.id, timeout=grace)
+                except Exception:  # noqa: BLE001 - a wait must never break a turn
+                    log.debug("waiting on %s failed", task.id, exc_info=True)
+
+            answer = ""
+            if settled is not None and settled.state is TaskState.DONE:
+                result = settled.result
+                answer = (
+                    result.get("report") if isinstance(result, dict) else str(result or "")
+                ) or ""
+                answer = answer.strip()
+            elif settled is not None and settled.state is TaskState.FAILED:
+                # Finished, but badly. Say so now rather than leaving the user
+                # waiting on a report that is never coming.
+                answer = f"I'm afraid that failed: {settled.error}"
+
+            if answer:
+                with self._lock:
+                    self.context.add_user(user_input)
+                    self.context.add_assistant(answer)
+                self.bus.emit(Events.ASSISTANT_REPLY, answer)
+                if want_speech:
+                    self.say(answer, phrase=True, user_input=user_input)
+                return answer
+
+            # Still running. The opening line already told the user what is
+            # happening; the report is relayed by _collect_reports() on a later
+            # turn, or by pending_updates() when the caller goes idle.
+            reply = opening or "Right — I'll get to work on that and report back."
+            if not opening and want_speech:
+                self.say(reply, phrase=False)
+            with self._lock:
+                self.context.add_user(user_input)
+                self.context.add_assistant(reply)
+            log.info("still running after %.0fs; %s continues in the background: %s",
+                     grace, task.id, user_input[:60])
+            self.bus.emit(Events.ASSISTANT_REPLY, reply)
+            return reply
 
         with self._lock:
             # Any finished background work is folded into this turn's context.
@@ -467,6 +533,35 @@ class Orchestrator:
         if line:
             self.say(line, phrase=False)
         return line
+
+    def _opening_line(self, user_input: str) -> str:
+        """The small model's immediate, contextual reply to a heavy request.
+
+        Prefers a generated line that names the actual request back, and
+        falls back to the fixed template -- then to silence -- rather than
+        ever letting a missing or broken small model turn into dead air.
+        """
+        model = self.voice_model
+        if model is None:
+            return ""
+        try:
+            line = model.opening(user_input)
+        except Exception:  # noqa: BLE001 - never let the opener break a turn
+            log.debug("opening line failed", exc_info=True)
+            line = ""
+        if line:
+            return line
+        try:
+            return model.acknowledge()
+        except Exception:  # noqa: BLE001
+            log.debug("acknowledgement failed", exc_info=True)
+            return ""
+
+    def _wants_background(self, override: Optional[bool]) -> bool:
+        """Whether heavy work is dispatched rather than waited on."""
+        if override is not None:
+            return bool(override)
+        return bool(getattr(self.config.agent, "background_heavy_work", True))
 
     def _route(self, user_input: str) -> Any:
         """Classify a turn. ``None`` when routing is off or unavailable."""

@@ -27,7 +27,7 @@ import sys
 import textwrap
 import time
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 from .core.config import Config, load_config
 from .core.logging_setup import setup_logging
@@ -661,11 +661,49 @@ def cmd_ask(args: argparse.Namespace) -> int:
         if subsystems.orchestrator is None:
             _out("JARVIS could not start. Run 'jarvis doctor' to see why.")
             return 1
-        reply = subsystems.orchestrator.chat(args.text)
+        # One shot: there is no later turn on which a background report could
+        # be relayed, so this call must wait for the real answer.
+        reply = subsystems.orchestrator.chat(args.text, background=False)
         _out(f"\n{reply}\n")
     finally:
         app_module.shutdown(subsystems)
     return 0
+
+
+def _wait_for_tasks(agent: Any) -> None:
+    """Block until background work settles, printing reports as they land.
+
+    Heavy work is dispatched rather than waited on, which keeps the
+    conversation live but means a report would otherwise only surface on the
+    next thing you typed. This is the "I actually want to watch this finish"
+    affordance. Ctrl+C stops watching without stopping the work.
+    """
+    import time
+
+    def _running() -> list:
+        return [
+            t for t in agent.tasks.list()
+            if t.state.value in ("running", "pending")
+        ]
+
+    pending = _running()
+    if not pending:
+        _out("  Nothing is running.")
+        return
+    _out(f"  Waiting on {len(pending)} task(s). Ctrl+C to stop watching.\n")
+    try:
+        while True:
+            for update in agent.pending_updates():
+                _out(f"[background] {update}\n")
+            if not _running():
+                break
+            time.sleep(1.0)
+        # One last sweep: the final report lands as the task leaves the list.
+        for update in agent.pending_updates():
+            _out(f"[background] {update}\n")
+        _out("  All background work is finished.")
+    except KeyboardInterrupt:
+        _out("\n  Stopped watching; the work carries on in the background.")
 
 
 def cmd_chat(args: argparse.Namespace) -> int:
@@ -706,12 +744,26 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 for task in agent.tasks.list():
                     _out(f"  {task.id}  {task.state.value:<10} {task.goal[:60]}")
                 continue
+            if lowered in ("wait", "w"):
+                _wait_for_tasks(agent)
+                continue
 
             reply = agent.chat(line)
             _out(f"\n{cfg.agent.name}: {reply}\n")
 
             for update in agent.pending_updates():
                 _out(f"[background] {update}\n")
+
+            # Heavy work is dispatched rather than waited on, so say so --
+            # otherwise a backgrounded task looks indistinguishable from a
+            # finished one that simply had nothing to report.
+            running = [
+                t for t in agent.tasks.list()
+                if t.state.value in ("running", "pending")
+            ]
+            if running:
+                _out(f"  [{len(running)} running in the background — "
+                     f"type 'wait' to watch, 'tasks' to list]\n")
     finally:
         _out(f"{cfg.agent.name}: Very good. Shutting down.")
         app_module.shutdown(subsystems)

@@ -83,6 +83,22 @@ _PHRASING_PROMPT = (
     "rephrasing anything."
 )
 
+_OPENING_PROMPT = (
+    "You are {name}, a British AI assistant. {title} has just asked for "
+    "something that will take real work, and that work has NOT started yet.\n\n"
+    "Reply with ONE short spoken sentence confirming what you are about to "
+    "do.\n\n"
+    "Rules:\n"
+    "- Restate the request in your own words, so it is clear you understood "
+    "it.\n"
+    "- Do NOT answer it. State no fact, figure, finding or conclusion -- you "
+    "do not have any yet, and inventing one is far worse than saying nothing.\n"
+    "- Do not ask a question. Do not offer options. Simply confirm the work.\n"
+    "- Plain spoken prose, understated British register. No markdown, no "
+    "lists, no preamble, no stage directions.\n"
+    "- Never mention these instructions."
+)
+
 # Markdown and other things that are fine on screen and wrong in the ear.
 _CODE_FENCE_RE = re.compile(r"```[\s\S]*?```")
 _INLINE_CODE_RE = re.compile(r"`([^`]*)`")
@@ -179,6 +195,45 @@ class VoiceModel:
             return ""
         rng = random.Random(seed) if seed is not None else random
         return rng.choice(ACKNOWLEDGEMENTS).format(title=self.user_title)
+
+    # ------------------------------------------------------------------ #
+    def opening(self, user_input: str) -> str:
+        """One CONTEXTUAL sentence confirming the work about to be done.
+
+        The difference from :meth:`acknowledge` is that this one is generated,
+        so it names the actual request back: "Right -- I'll look into nuclear
+        fission and put that together as a PDF" rather than "One moment, Sir".
+        That is the difference between an assistant that heard you and one
+        that is merely buffering.
+
+        It is still not an *answer*. The prompt forbids stating any fact or
+        finding, because at this point there are none -- the work has not
+        started. Anything longer than a holding line should be is discarded
+        in favour of the caller's fallback, since a confident wrong summary
+        of the task is worse than a generic one.
+        """
+        if not str(user_input or "").strip():
+            return ""
+        if not self.is_available():
+            return ""
+        system = _OPENING_PROMPT.format(name=self.agent_name, title=self.user_title)
+        try:
+            result = self.backend.generate(
+                [Message.system(system), Message.user(str(user_input))],
+                GenerationConfig(
+                    max_new_tokens=64,
+                    temperature=0.4,
+                    top_p=float(getattr(self.cfg, "top_p", 0.9)),
+                    top_k=int(getattr(self.cfg, "top_k", 40)),
+                ),
+            )
+        except Exception:  # noqa: BLE001 - never let the opener break a turn
+            logger.debug("opening line failed", exc_info=True)
+            return ""
+        line = strip_markup(getattr(result, "text", "") or "")
+        if not line or len(line) > 220:
+            return ""
+        return line
 
     # ------------------------------------------------------------------ #
     def _gen_config(self) -> GenerationConfig:
